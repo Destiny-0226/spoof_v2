@@ -26,6 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+from smbios_memory import validate_record as validate_memory_record, xml_memory_bytes
+
 ROOT = Path(__file__).resolve().parent
 ARTIFACTS = ROOT / "artifacts"
 PROFILE_PATH = ARTIFACTS / "identity-hardware.json"
@@ -142,14 +144,7 @@ def fit_vcpu_count(root: ET.Element, available: set[int]) -> int:
 
 def validate_hardware_baseline(root: ET.Element, profile: dict) -> None:
     """Reject XML drift that would contradict the generated SMBIOS profile."""
-    memory = root.find("memory")
-    if memory is None or not (memory.text or "").strip():
-        raise ValueError("当前 XML 缺少内存容量")
-    multipliers = {
-        "b": 1, "bytes": 1, "kb": 1000, "kib": 1024,
-        "mb": 1000**2, "mib": 1024**2, "gb": 1000**3, "gib": 1024**3,
-    }
-    actual_memory = int(memory.text.strip(), 0) * multipliers.get(memory.get("unit", "KiB").lower(), 1)
+    actual_memory = xml_memory_bytes(root)
     expected_memory = int(profile["vm_baseline"]["memory_bytes"])
     if actual_memory != expected_memory:
         raise ValueError("当前 XML 的内存容量已改变，请重新运行 01_generate_identity.py")
@@ -274,8 +269,7 @@ def load_artifacts() -> tuple[dict, bytes]:
     if not profile_path.exists() or not smbios_path.exists():
         raise FileNotFoundError("缺少 identity-hardware.json 或 smbios.bin，请先运行 01_generate_identity.py")
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
-    if int(profile.get("meta", {}).get("schema_version", 0)) < 23:
-        raise ValueError("身份文件版本过旧，请重新运行 01_generate_identity.py（需要完整 Root Port profile）")
+    validate_memory_record(profile)
     if (
         profile.get("meta", {}).get("platform_source") != "host-non-unique"
         or int(profile.get("meta", {}).get("platform_source_version", 0)) != 3
@@ -289,6 +283,7 @@ def load_artifacts() -> tuple[dict, bytes]:
     actual = hashlib.sha256(smbios).hexdigest()
     if expected != actual:
         raise ValueError("smbios.bin 与 identity-hardware.json 不匹配")
+    validate_memory_record(profile, smbios)
     if profile.get("source", {}).get("domain") is None:
         raise ValueError("身份文件缺少源虚拟机名称")
     if profile.get("hardware", {}).get("audio", {}).get("xml_policy") != "onboard-hda" or profile.get("xml_policy", {}).get("audio") != "onboard-hda":

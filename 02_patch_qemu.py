@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from smbios_memory import validate_record as validate_memory_record
+
 ROOT = Path(__file__).resolve().parent
 PROFILE_PATH = ROOT / "artifacts" / "identity-hardware.json"
 RESOURCES = ROOT / "resources"
@@ -2793,8 +2795,7 @@ def main() -> int:
     if not PROFILE_PATH.is_file():
         raise RuntimeError("缺少 artifacts/identity-hardware.json，请先运行 01_generate_identity.py")
     profile = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
-    if int(profile.get("meta", {}).get("schema_version", 0)) < 23:
-        raise RuntimeError("身份文件版本过旧，请重新运行 01_generate_identity.py（需要完整 Root Port profile）")
+    validate_memory_record(profile, (ROOT / "artifacts/smbios.bin").read_bytes())
     if (
         profile.get("meta", {}).get("platform_source") != "host-non-unique"
         or int(profile.get("meta", {}).get("platform_source_version", 0)) != 3

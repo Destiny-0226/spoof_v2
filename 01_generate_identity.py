@@ -31,9 +31,14 @@ from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree as ET
 
+from smbios_memory import (
+    MEMORY_LAYOUT, SCHEMA_VERSION, choose_layout, guest_slots, memory_tables,
+    q35_ranges, validate_record as validate_memory_record, validate_stream,
+    xml_memory_bytes,
+)
+
 ROOT = Path(__file__).resolve().parent
 ARTIFACTS = ROOT / "artifacts"
-SCHEMA_VERSION = 23
 PLATFORM_SOURCE_VERSION = 3
 Q35_DERIVED_SATA_ADDRESS = {
     "domain": "0x0000",
@@ -304,11 +309,7 @@ def unit_multiplier(unit: str) -> int:
 
 
 def memory_bytes(root: ET.Element) -> int:
-    node = root.find("memory")
-    if node is None or not (node.text or "").strip():
-        return 8 * 1024**3
-    value = int(node.text.strip(), 0)
-    return max(256 * 1024**2, value * unit_multiplier(node.get("unit", "KiB")))
+    return xml_memory_bytes(root)
 
 
 def cpu_topology(root: ET.Element) -> dict[str, int]:
@@ -597,6 +598,8 @@ def host_smbios_facts(unique_identifiers: dict[str, str]) -> dict[str, Any]:
     processor: dict[str, Any] | None = None
     modules: list[dict[str, Any]] = []
     memory_array: dict[str, Any] | None = None
+    memory_array_handle: int | None = None
+    memory_device_arrays: list[int] = []
     connectors: list[dict[str, Any]] = []
     slots: list[dict[str, Any]] = []
     oem_strings: list[str] = []
@@ -624,9 +627,12 @@ def host_smbios_facts(unique_identifiers: dict[str, str]) -> dict[str, Any]:
             oem_strings.extend(value for value in strings if safe_oem_string(value, unique_variants))
         elif kind in {12, 13, 26, 28, 29}:
             supplemental.append(encode_host_smbios_table(kind, formatted, strings))
-        elif kind == 16 and memory_array is None:
+        elif kind == 16:
+            if memory_array is not None:
+                raise RuntimeError("当前内存模型仅支持单个物理内存阵列")
             if len(formatted) < 15:
                 raise RuntimeError("宿主 SMBIOS Type 16 长度不足")
+            memory_array_handle = struct.unpack_from("<H", formatted, 2)[0]
             maximum_kib = struct.unpack_from("<I", formatted, 7)[0]
             if maximum_kib == 0x80000000:
                 if len(formatted) < 23:
@@ -644,7 +650,10 @@ def host_smbios_facts(unique_identifiers: dict[str, str]) -> dict[str, Any]:
         elif kind == 17:
             if len(formatted) < 27:
                 raise RuntimeError("宿主 SMBIOS Type 17 长度不足")
+            memory_device_arrays.append(struct.unpack_from("<H", formatted, 4)[0])
             size_field = struct.unpack_from("<H", formatted, 12)[0]
+            if size_field == 0xFFFF:
+                raise RuntimeError("宿主 Type 17 安装容量未知，不能视作空槽")
             installed = size_field not in {0, 0xFFFF}
             memory_type_code = formatted[18]
             memory_type = memory_types.get(memory_type_code) if installed else None
@@ -672,6 +681,8 @@ def host_smbios_facts(unique_identifiers: dict[str, str]) -> dict[str, Any]:
     installed_modules = [item for item in modules if item["installed"]]
     if memory_array is None or not installed_modules:
         raise RuntimeError("宿主 SMBIOS 缺少 Type 16 或已安装的 Type 17")
+    if memory_array["use"] != 3 or any(handle != memory_array_handle for handle in memory_device_arrays):
+        raise RuntimeError("宿主 Type 17 未关联到唯一的系统内存阵列")
     if memory_array["device_slots"] != len(modules):
         raise RuntimeError("宿主 SMBIOS Type 16 插槽数与 Type 17 数量不一致")
     types = {item["type"] for item in installed_modules}
@@ -1825,27 +1836,11 @@ def host_platform_profile(
     return platform
 
 
-def dimm_layout(total_bytes: int, memory_type: str, platform_class: str) -> list[int]:
-    if total_bytes % (1024 * 1024):
-        raise RuntimeError("Guest XML 内存容量必须是整 MiB")
-    total_mib = total_bytes // (1024 * 1024)
-    if total_mib < 4096 or total_mib % 4096:
-        raise RuntimeError("Guest 内存必须是 4 GiB 的整数倍，且单条不小于 4 GiB")
+def dimm_layout(total_bytes: int, memory_type: str, platform_class: str, array: dict) -> list[int]:
     catalog = MEMORY_CATALOG.get((memory_type, platform_class))
     if not catalog:
         raise RuntimeError(f"没有 {platform_class} {memory_type} 内存配件池")
-    common = tuple(sorted((size for size in catalog if size >= 4096), reverse=True))
-    if 4096 not in common:
-        raise RuntimeError(f"{platform_class} {memory_type} 配件池缺少最小 4 GiB 规格")
-    remaining = total_mib
-    layout: list[int] = []
-    for size in common:
-        while remaining >= size:
-            layout.append(size)
-            remaining -= size
-    if remaining or not layout:
-        raise RuntimeError(f"无法用常见内存条规格表示 Guest 内存: {total_mib} MiB")
-    return layout
+    return choose_layout(total_bytes, catalog, array)
 
 
 def memory_identity(memory_type: str, platform_class: str, sizes_mib: list[int]) -> tuple[str, list[str]]:
@@ -1987,30 +1982,8 @@ def smbios_cache_size(size_kib: int) -> tuple[int, int]:
     return legacy, extended
 
 
-def validate_smbios_memory_topology(data: bytes, sizes_mib: list[int]) -> None:
-    tables = list(iter_smbios_structures(data))
-    type16 = [formatted for kind, formatted, _ in tables if kind == 16]
-    type17 = [formatted for kind, formatted, _ in tables if kind == 17]
-    type19 = [formatted for kind, formatted, _ in tables if kind == 19]
-    type20 = [formatted for kind, formatted, _ in tables if kind == 20]
-    if len(type16) != 1 or len(type19) != 1:
-        raise RuntimeError("SMBIOS 内存拓扑必须各有一条 Type 16/19")
-    if len(type17) != len(sizes_mib) or len(type20) != len(sizes_mib):
-        raise RuntimeError("SMBIOS Type 17/20 数量与 Guest DIMM 拆分不一致")
-    array_handle = struct.unpack_from("<H", type16[0], 2)[0]
-    if struct.unpack_from("<H", type16[0], 13)[0] != len(sizes_mib):
-        raise RuntimeError("SMBIOS Type 16 memory device 数量错误")
-    dimm_handles = {struct.unpack_from("<H", item, 2)[0] for item in type17}
-    if any(struct.unpack_from("<H", item, 4)[0] != array_handle for item in type17):
-        raise RuntimeError("SMBIOS Type 17 没有引用 Guest Type 16")
-    mapped_handle = struct.unpack_from("<H", type19[0], 2)[0]
-    if struct.unpack_from("<H", type19[0], 12)[0] != array_handle:
-        raise RuntimeError("SMBIOS Type 19 没有引用 Guest Type 16")
-    for item in type20:
-        if struct.unpack_from("<H", item, 12)[0] not in dimm_handles:
-            raise RuntimeError("SMBIOS Type 20 引用了不存在的 Type 17")
-        if struct.unpack_from("<H", item, 14)[0] != mapped_handle:
-            raise RuntimeError("SMBIOS Type 20 没有引用 Guest Type 19")
+def validate_smbios_memory_topology(data: bytes, profile: dict, platform: dict, identity: dict) -> None:
+    validate_stream(data, profile, platform, identity)
 
 
 def build_smbios_stream(profile: dict, platform: dict, identity: dict) -> bytes:
@@ -2089,44 +2062,7 @@ def build_smbios_stream(profile: dict, platform: dict, identity: dict) -> bytes:
             raise RuntimeError(f"不允许复制的 SMBIOS 补充表: Type {kind}")
         out.append(smbios_structure(kind, 0x3000 + index, body, item.get("strings") or ()))
 
-    sizes = [int(value) for value in profile["dimm_sizes_mb"]]
-    total_mb = sum(sizes)
-    capacity_bytes = total_mb * 1024 * 1024
-    capacity_kib = capacity_bytes // 1024
-    max_field = capacity_kib if capacity_kib < 0x80000000 else 0x80000000
-    extended_capacity = 0 if capacity_kib < 0x80000000 else capacity_bytes
-    array_template = profile["memory_array"]
-    out.append(smbios_structure(16, 0x1000, struct.pack(
-        "<BBBIHHQ", int(array_template["location"]), int(array_template["use"]),
-        int(array_template["error_correction"]), max_field, 0xFFFE, len(sizes), extended_capacity,
-    )))
-
-    address = 0
-    ranges: list[tuple[int, int, int]] = []
-    memory_type = int(platform["memory_type_code"])
-    slot_templates = list(profile.get("memory_slots") or [])
-    form_factor = int(platform["memory_form_factor"])
-    voltage = 1100 if profile["memory_type"] == "ddr5" else 1200
-    for index, size_mb in enumerate(sizes):
-        template = slot_templates[index] if index < len(slot_templates) else {}
-        device_locator = str(template.get("device_locator") or f"DIMM_{chr(65 + index)}")
-        bank_locator = str(template.get("bank_locator") or f"BANK_{index // 2}")
-        size_field, extended_size = (size_mb, 0) if size_mb < 0x7FFF else (0x7FFF, size_mb)
-        body = struct.pack("<5H5B2H5BI4H", 0x1000, 0xFFFE, 64, 64, size_field, form_factor, 0, 1, 2, memory_type, 0x80, profile["memory_speed"], 3, 4, 5, 6, 1, extended_size, profile["memory_speed"], voltage, voltage, voltage)
-        out.append(smbios_structure(17, 0x1100 + index, body, [device_locator, bank_locator, profile["memory_vendor"], profile["dimm_serials"][index], identity["dimm_assets"][index], profile["dimm_parts"][index]]))
-        end = address + size_mb * 1024 * 1024 - 1
-        ranges.append((address, end, 0x1100 + index))
-        address = end + 1
-
-    end_kib = max(0, total_mb * 1024 - 1)
-    if end_kib <= 0xFFFFFFFF:
-        mapped = struct.pack("<IIH B Q Q", 0, end_kib, 0x1000, len(sizes), 0, 0)
-    else:
-        mapped = struct.pack("<IIH B Q Q", 0xFFFFFFFF, 0xFFFFFFFF, 0x1000, len(sizes), 0, capacity_bytes - 1)
-    out.append(smbios_structure(19, 0x1300, mapped))
-    for index, (start, end, dimm_handle) in enumerate(ranges):
-        body = struct.pack("<IIHHB B B Q Q", start // 1024, end // 1024, dimm_handle, 0x1300, index + 1, 0, 1, 0, 0)
-        out.append(smbios_structure(20, 0x1400 + index, body))
+    out.extend(memory_tables(profile, platform, identity))
 
     battery = profile.get("battery", {"enabled": False})
     if battery.get("enabled"):
@@ -2148,7 +2084,7 @@ def build_smbios_stream(profile: dict, platform: dict, identity: dict) -> bytes:
     data = b"".join(out)
     if not data.endswith(struct.pack("<BBH", 127, 4, 0x7F00) + b"\0\0"):
         raise ValueError("SMBIOS stream has no valid Type 127 terminator")
-    validate_smbios_memory_topology(data, sizes)
+    validate_smbios_memory_topology(data, profile, platform, identity)
     return data
 
 
@@ -2255,7 +2191,8 @@ def build_record(
     battery = battery_profile(detected_battery, bool(platform["has_battery"]))
     topology = cpu_topology(root)
     total_memory = memory_bytes(root)
-    sizes = dimm_layout(total_memory, platform["memory_type"], platform["class"])
+    sizes = dimm_layout(total_memory, platform["memory_type"], platform["class"], smbios_facts["memory"]["array"])
+    memory_slots = guest_slots(sizes, smbios_facts["memory"]["slots"], smbios_facts["memory"]["array"])
     memory_vendor, dimm_parts = memory_identity(platform["memory_type"], platform["class"], sizes)
     cache = host_cache_sizes()
     storage = parse_storage(root)
@@ -2472,7 +2409,7 @@ def build_record(
         "oem_strings": deepcopy(smbios_facts.get("oem_strings") or []),
         "supplemental_tables": deepcopy(smbios_facts.get("supplemental") or []),
         "memory_array": deepcopy(smbios_facts["memory"]["array"]),
-        "memory_slots": deepcopy(smbios_facts["memory"]["slots"]),
+        "memory_slots": deepcopy(memory_slots),
         "connectors": deepcopy(smbios_facts.get("connectors") or []),
         "slots": deepcopy(smbios_facts.get("slots") or []),
         "created_at": now,
@@ -2537,7 +2474,9 @@ def build_record(
                 "part": legacy["memory_part"],
                 "parts": dimm_parts,
                 "array": deepcopy(smbios_facts["memory"]["array"]),
-                "slots": deepcopy(smbios_facts["memory"]["slots"]),
+                "slots": deepcopy(memory_slots),
+                "layout": MEMORY_LAYOUT,
+                "mapped_ranges": q35_ranges(total_memory),
             },
             "power": power,
             "storage_controller": {
@@ -2617,6 +2556,7 @@ def build_record(
         "smbios_profile": legacy,
     }
     validate_record_coherence(record)
+    validate_memory_record(record, smbios)
     record["artifacts"] = {"smbios_sha256": hashlib.sha256(smbios).hexdigest()}
     return record, smbios
 
