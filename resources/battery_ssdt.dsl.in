@@ -1,0 +1,98 @@
+DefinitionBlock ("", "SSDT", 2, "@OEM_ID@", "@TABLE_ID@", 0x00000001)
+{
+    External (\_SB.PCI0, DeviceObj)
+
+    Scope (\_SB.PCI0)
+    {
+        Device (ADP0)
+        {
+            Name (_HID, "ACPI0003")
+            Name (_UID, Zero)
+            Method (_STA, 0, NotSerialized)
+            {
+                Return (0x0F)
+            }
+            Method (_PSR, 0, NotSerialized)
+            {
+                Return (@AC_ONLINE@)
+            }
+            Name (_PCL, Package (One) { \_SB })
+        }
+
+        Device (BAT0)
+        {
+            Name (_HID, EisaId ("PNP0C0A"))
+            Name (_UID, Zero)
+            Method (_STA, 0, NotSerialized)
+            {
+                Return (0x1F)
+            }
+            Method (_BIF, 0, NotSerialized)
+            {
+                Return (Package (0x0D)
+                {
+                    Zero,
+                    @DESIGN_CAPACITY@,
+                    @FULL_CAPACITY@,
+                    One,
+                    @DESIGN_VOLTAGE@,
+                    @WARNING_CAPACITY@,
+                    @LOW_CAPACITY@,
+                    @GRANULARITY@,
+                    @GRANULARITY@,
+                    "@MODEL@",
+                    "@SERIAL@",
+                    "@CHEMISTRY@",
+                    "@MANUFACTURER@"
+                })
+            }
+            Method (_BST, 0, NotSerialized)
+            {
+                Return (Package (0x04)
+                {
+                    @BATTERY_STATE@,
+                    @PRESENT_RATE@,
+                    @REMAINING_CAPACITY@,
+                    @PRESENT_VOLTAGE@
+                })
+            }
+        }
+    }
+
+    Scope (\_SB)
+    {
+        Device (FAN0)
+        {
+            Name (_HID, EisaId ("PNP0C0B"))
+            Name (_UID, Zero)
+            Method (_STA, 0, NotSerialized)
+            {
+                Return (0x0F)
+            }
+        }
+    }
+
+    Scope (\_TZ)
+    {
+        ThermalZone (TZ00)
+        {
+            Method (_TMP, 0, NotSerialized)
+            {
+                Return (@TEMP_CURRENT@)
+            }
+            Method (_AC0, 0, NotSerialized)
+            {
+                Return (@TEMP_ACTIVE@)
+            }
+            Name (_AL0, Package (One) { \_SB.FAN0 })
+            Method (_PSV, 0, NotSerialized)
+            {
+                Return (@TEMP_PASSIVE@)
+            }
+            Method (_CRT, 0, NotSerialized)
+            {
+                Return (@TEMP_CRITICAL@)
+            }
+        }
+    }
+}

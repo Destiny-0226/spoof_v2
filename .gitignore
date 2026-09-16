@@ -1,0 +1,69 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- 本机生成的身份与部署产物 ---
+# 01 生成的唯一 UUID / 序列号 / MAC / SMBIOS，不要入库
+artifacts/
+# 04 备份的本机 libvirt XML
+backups/
+# 02/03 构建出的 QEMU、OVMF、源码副本和固件镜像
+build/
+
+# --- 上游源码树（脚本会按锁定 tag 自动拉取，体积数 GB） ---
+resources/qemu11backup/
+resources/ovmfbackup/
+
+# --- 第三方对照目录（含二进制与独立仓库，不属于本项目源码） ---
+Nika/
+
+# --- 编译 / 固件 / 镜像副产物 ---
+*.o
+*.a
+*.qcow2
+*.fd
+*.aml
+*.bin
+*.img
+*.iso
+*.raw
+*.vmdk
+*.qcow
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*~
+
+# --- 编辑器 / OS / 本机工具 ---
+.codex/
+.agents/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- 密钥与本机配置 ---
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
