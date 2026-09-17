@@ -8,7 +8,7 @@ from xml.etree import ElementTree as ET
 
 MIB = 1024**2
 GIB = 1024**3
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 MEMORY_LAYOUT = "q35-fixed-sequential-v1"
 
 
@@ -169,13 +169,24 @@ def memory_tables(profile: dict, platform: dict, identity: dict) -> list[bytes]:
         installed, size = slot["installed"], slot["size_mib"]
         size_field = size if size < 0x7FFF else 0x7FFF
         speed = int(profile["memory_speed"]) if installed else 0
-        voltage = (1100 if profile["memory_type"] == "ddr5" else 1200) if installed else 0
+        rated = int(profile["memory_rated_speed"]) if installed else 0
+        if not 0 <= rated <= 0xFFFFFFFF or not 0 <= speed <= 0xFFFFFFFF:
+            raise ValueError("Memory speed is outside the SMBIOS range")
+        voltages = [int(profile[key]) if installed else 0 for key in
+                    ("memory_min_voltage", "memory_max_voltage", "memory_configured_voltage")]
+        if any(value != 0 for value in voltages) or rated != 0:
+            raise ValueError("Unobserved virtual DIMM electrical/rated values must remain unknown")
         body = struct.pack(
             "<5H5B2H5BI4H", 0x1000, 0xFFFE, 64 if installed else 0xFFFF,
             64 if installed else 0xFFFF, size_field, slot["form_factor"], 0, 1, 2,
             int(platform["memory_type_code"]) if installed else 0x02, 0x80 if installed else 0,
-            speed, 3 if installed else 0, 4 if installed else 0, 5 if installed else 0,
-            6 if installed else 0, 0, size if size_field == 0x7FFF else 0, speed, voltage, voltage, voltage,
+            rated, 3 if installed else 0, 4 if installed else 0, 5 if installed else 0,
+            6 if installed else 0, 0, size if size_field == 0x7FFF else 0, min(speed, 0xFFFF), *voltages,
+        )
+        body += struct.pack(
+            "<BHB4H4Q2I", 3 if installed else 2, 8 if installed else 4,
+            0, 0, 0, 0, 0, 0, size * MIB, 0, 0, 0,
+            speed if speed >= 0xFFFF else 0,
         )
         strings = [slot["device_locator"], slot["bank_locator"]]
         if installed:
@@ -222,7 +233,7 @@ def validate_stream(data: bytes, profile: dict, platform: dict, identity: dict) 
 def validate_record(record: dict, data: bytes | None = None) -> None:
     try:
         if record["meta"]["schema_version"] != SCHEMA_VERSION:
-            raise ValueError("身份文件需要 schema 24，请重新运行 01 并重建 02/03")
+            raise ValueError("身份文件需要 schema 25，请重新运行 01 并重建 02/03")
         profile = record["smbios_profile"]
         memory = record["hardware"]["memory"]
         host_memory = record["host"]["smbios_non_unique"]["memory"]
@@ -243,7 +254,26 @@ def validate_record(record: dict, data: bytes | None = None) -> None:
             raise ValueError("内存映射仅适用于 pc-q35-11.0")
         if profile["dimm_count"] != len(sizes) or memory["parts"] != profile["dimm_parts"]:
             raise ValueError("Guest 内存数量或料号不一致")
+        from smbios_contract import ENTRY_POINT, FIRMWARE_SIZE, build_smbios_stream, validate_profile
+
+        validate_profile(profile)
+        topology = record["vm_baseline"]["topology"]
+        cores = topology["dies"] * topology["clusters"] * topology["cores"]
+        if (profile["sockets"], profile["cores"], profile["threads"]) != (
+            topology["sockets"], cores, cores * topology["threads"],
+        ) or topology["vcpus"] != topology["sockets"] * cores * topology["threads"]:
+            raise ValueError("SMBIOS CPU counts differ from XML baseline")
+        if record["qemu_policy"]["smbios_entry_point"] != ENTRY_POINT:
+            raise ValueError("SMBIOS entry point must declare the supported 3.5 layout")
+        if record["ovmf_policy"].get("flash_size_bytes") != FIRMWARE_SIZE:
+            raise ValueError("OVMF flash size is not bound to the SMBIOS contract")
+        if memory["type"] != profile["memory_type"] or memory["speed_mt"] != profile["memory_speed"]:
+            raise ValueError("Memory type/speed mirrors disagree")
+        if memory["vendor"] != profile["memory_vendor"] or record["identity"]["dimm_serials"] != profile["dimm_serials"]:
+            raise ValueError("Memory identity mirrors disagree")
         if data is not None:
             validate_stream(data, profile, record["hardware"]["platform"], record["identity"])
+            if data != build_smbios_stream(profile, record["hardware"]["platform"], record["identity"]):
+                raise ValueError("Complete SMBIOS stream differs from the declared profile")
     except (KeyError, TypeError, OverflowError, struct.error) as error:
         raise ValueError("内存身份结构不完整或无效，请重新运行 01") from error

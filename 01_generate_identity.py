@@ -31,9 +31,11 @@ from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree as ET
 
+from smbios_contract import ENTRY_POINT, FIRMWARE_SIZE, build_smbios_stream, configure_guest_profile
+
 from smbios_memory import (
-    MEMORY_LAYOUT, SCHEMA_VERSION, choose_layout, guest_slots, memory_tables,
-    q35_ranges, validate_record as validate_memory_record, validate_stream,
+    MEMORY_LAYOUT, SCHEMA_VERSION, choose_layout, guest_slots,
+    q35_ranges, validate_record as validate_memory_record,
     xml_memory_bytes,
 )
 
@@ -315,6 +317,12 @@ def memory_bytes(root: ET.Element) -> int:
 def cpu_topology(root: ET.Element) -> dict[str, int]:
     vcpu_node = root.find("vcpu")
     vcpu = int((vcpu_node.text or "1").strip(), 0) if vcpu_node is not None else 1
+    if not 1 <= vcpu <= 65535:
+        raise ValueError("Invalid fixed vCPU count")
+    if vcpu_node is not None and int(vcpu_node.get("current", str(vcpu)), 0) != vcpu:
+        raise ValueError("Fixed CPU model requires current vCPUs to equal maximum vCPUs")
+    if root.find("vcpus") is not None:
+        raise ValueError("Per-vCPU hotplug state is not supported by the fixed SMBIOS model")
     topo = root.find("cpu/topology")
     if topo is None:
         return {"vcpus": vcpu, "sockets": 1, "dies": 1, "clusters": 1, "cores": vcpu, "threads": 1}
@@ -327,6 +335,8 @@ def cpu_topology(root: ET.Element) -> dict[str, int]:
         "threads": int(topo.get("threads", "1"), 0),
     }
     product = values["sockets"] * values["dies"] * values["clusters"] * values["cores"] * values["threads"]
+    if any(value <= 0 for value in values.values()):
+        raise ValueError("CPU topology dimensions must be positive")
     if product != vcpu:
         raise ValueError(f"XML CPU topology ({product}) does not match vCPU count ({vcpu})")
     return values
@@ -1950,142 +1960,6 @@ def battery_profile(host_battery: dict[str, Any] | None, enabled: bool) -> dict[
     }
 
 
-def smbios_uuid(value: str) -> bytes:
-    raw = uuid.UUID(value).bytes
-    return raw[0:4][::-1] + raw[4:6][::-1] + raw[6:8][::-1] + raw[8:]
-
-
-def smbios_structure(kind: int, handle: int, body: bytes, strings: Iterable[str] = ()) -> bytes:
-    values = [str(item) for item in strings]
-    if any("\0" in item for item in values):
-        raise ValueError("SMBIOS strings cannot contain NUL")
-    area = b"\0\0" if not values else b"".join(item.encode("ascii", "strict") + b"\0" for item in values) + b"\0"
-    return struct.pack("<BBH", kind, len(body) + 4, handle) + body + area
-
-
-def smbios_cache_size(size_kib: int) -> tuple[int, int]:
-    """Encode SMBIOS Type 7 legacy and extended cache-size fields."""
-    size = max(1, int(size_kib))
-    if size <= 0x7FFF:
-        legacy = size
-    elif (size + 63) // 64 <= 0x7FFF:
-        legacy = 0x8000 | ((size + 63) // 64)
-    else:
-        legacy = 0xFFFF
-
-    if size <= 0x7FFFFFFF:
-        extended = size
-    elif (size + 63) // 64 <= 0x7FFFFFFF:
-        extended = 0x80000000 | ((size + 63) // 64)
-    else:
-        extended = 0xFFFFFFFF
-    return legacy, extended
-
-
-def validate_smbios_memory_topology(data: bytes, profile: dict, platform: dict, identity: dict) -> None:
-    validate_stream(data, profile, platform, identity)
-
-
-def build_smbios_stream(profile: dict, platform: dict, identity: dict) -> bytes:
-    """Build a complete SMBIOS structure stream owned by spoof_v2."""
-    out: list[bytes] = []
-    vendor = profile["vendor"]
-    body = struct.pack(
-        "<BBHBBQ2B4BH",
-        1, 2, 0xE000, 3, 0xFF, 0x0000000000099A80, 0x03, 0x0D,
-        int(platform["bios_major_release"]), int(platform["bios_minor_release"]),
-        int(platform["ec_major_release"]), int(platform["ec_minor_release"]),
-        16,
-    )
-    out.append(smbios_structure(0, 0x0000, body, [profile["bios_vendor"], profile["bios_version"], profile["bios_date"]]))
-
-    body = struct.pack("<4B", 1, 2, 3, 4) + smbios_uuid(profile["system_uuid"]) + struct.pack("<BBB", 0x06, 5, 6)
-    out.append(smbios_structure(1, 0x0100, body, [vendor, profile["product_name"], profile["product_version"], profile["system_serial"], profile["product_sku"], profile["product_family"]]))
-
-    body = struct.pack("<7B H 2B", 1, 2, 3, 4, 5, 0x09, 6, 0x0300, 0x0A, 0)
-    out.append(smbios_structure(2, 0x0200, body, [platform["board_vendor"], profile["board_name"], profile["board_version"], profile["board_serial"], identity["board_asset"], "Main Board"]))
-
-    chassis_type = int(platform["chassis_type"])
-    body = struct.pack("<9B I 4B B", 1, chassis_type, 2, 3, 4, 3, 3, 3, 2, 0, 0, 1, 0, 0, 5)
-    out.append(smbios_structure(3, 0x0300, body, [platform["chassis_vendor"], profile["chassis_version"], profile["chassis_serial"], identity["chassis_asset"], identity["chassis_sku"]]))
-
-    for socket_index in range(profile["sockets"]):
-        body = bytearray(44)
-        family_code = profile["cpu_family"]
-        family2_code = profile["cpu_family2"]
-        body[0:4] = bytes((1, 3, family_code, 2))
-        struct.pack_into("<II", body, 4, profile["cpu_signature"], profile["cpu_features_edx"])
-        body[12:14] = bytes((3, profile["cpu_voltage"]))
-        struct.pack_into("<HHH", body, 14, profile["cpu_external_clock_mhz"], profile["cpu_max_mhz"], min(profile["cpu_current_mhz"], profile["cpu_max_mhz"]))
-        body[20:22] = bytes((0x41, profile["cpu_upgrade"]))
-        struct.pack_into("<HHH", body, 22, 0x0701, 0x0702, 0x0703)
-        body[28:31] = bytes((4, 5, 6))
-        body[31:34] = bytes((min(profile["cores"], 255), min(profile["enabled_cores"], 255), min(profile["threads"], 255)))
-        struct.pack_into("<HHHH", body, 34, profile["cpu_characteristics"], family2_code, profile["cores"], profile["enabled_cores"])
-        struct.pack_into("<H", body, 42, profile["threads"])
-        out.append(smbios_structure(4, 0x0400 + socket_index, bytes(body), [f"{profile['cpu_socket']} {socket_index + 1}", profile["cpu_vendor"], profile["cpu_version"], profile["cpu_serial"], identity["cpu_asset"], profile["cpu_part"]]))
-
-    for handle, label, level, size, kind in (
-        (0x0701, "L1 Cache", 0, profile["cache_l1_kib"], 0x05),
-        (0x0702, "L2 Cache", 1, profile["cache_l2_kib"], 0x05),
-        (0x0703, "L3 Cache", 2, profile["cache_l3_kib"], 0x05),
-    ):
-        legacy_size, extended = smbios_cache_size(int(size))
-        body = struct.pack("<BHHHHHBBBBII", 1, 0x0180 | level, legacy_size, legacy_size, 0x0003, 0x0003, 0, 0x02, kind, 0x02, extended, extended)
-        out.append(smbios_structure(7, handle, body, [label]))
-
-    for index, item in enumerate(profile.get("connectors") or []):
-        try:
-            body = bytes.fromhex(str(item["body"]))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("SMBIOS Type 8 记录损坏") from exc
-        out.append(smbios_structure(8, 0x0800 + index, body, item.get("strings") or ()))
-    for index, item in enumerate(profile.get("slots") or []):
-        try:
-            body = bytes.fromhex(str(item["body"]))
-        except (KeyError, TypeError, ValueError) as extra:
-            raise RuntimeError("SMBIOS Type 9 记录损坏") from extra
-        out.append(smbios_structure(9, 0x0900 + index, body, item.get("strings") or ()))
-
-    oem_strings = list(profile.get("oem_strings") or [])
-    if oem_strings:
-        if len(oem_strings) > 255:
-            raise RuntimeError("SMBIOS Type 11 OEM string 数量超限")
-        out.append(smbios_structure(11, 0x0B00, bytes((len(oem_strings),)), oem_strings))
-    for index, item in enumerate(profile.get("supplemental_tables") or []):
-        try:
-            kind = int(item["type"])
-            body = bytes.fromhex(str(item["body"]))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("宿主 SMBIOS 补充表损坏") from exc
-        if kind not in {12, 13, 26, 28, 29}:
-            raise RuntimeError(f"不允许复制的 SMBIOS 补充表: Type {kind}")
-        out.append(smbios_structure(kind, 0x3000 + index, body, item.get("strings") or ()))
-
-    out.extend(memory_tables(profile, platform, identity))
-
-    battery = profile.get("battery", {"enabled": False})
-    if battery.get("enabled"):
-        multiplier = max(1, (int(battery["design_capacity_mwh"]) + 0xFFFE) // 0xFFFF)
-        capacity = min(0xFFFF, int(battery["design_capacity_mwh"]) // multiplier)
-        body = struct.pack(
-            "<6BHHBBHHBBI",
-            1, 2, 3, 4, 5, 0x06, capacity, int(battery["design_voltage_mv"]),
-            6, 0xFF, int(battery["sbds_serial"]), int(battery["sbds_manufacture_date"]),
-            7, multiplier, 0,
-        )
-        out.append(smbios_structure(22, 0x1600, body, [
-            "Internal Battery", battery["manufacturer"], battery["manufacture_date"],
-            battery["serial"], battery["model"], "03.0", battery["chemistry"],
-        ]))
-
-    out.append(smbios_structure(32, 0x2000, bytes(7)))
-    out.append(smbios_structure(127, 0x7F00, b""))
-    data = b"".join(out)
-    if not data.endswith(struct.pack("<BBH", 127, 4, 0x7F00) + b"\0\0"):
-        raise ValueError("SMBIOS stream has no valid Type 127 terminator")
-    validate_smbios_memory_topology(data, profile, platform, identity)
-    return data
 
 
 def validate_record_coherence(record: dict[str, Any]) -> None:
@@ -2414,6 +2288,7 @@ def build_record(
         "slots": deepcopy(smbios_facts.get("slots") or []),
         "created_at": now,
     }
+    legacy = configure_guest_profile(legacy)
     smbios = build_smbios_stream(legacy, platform, identity)
     xml_sha = hashlib.sha256(xml_text.encode()).hexdigest()
     record: dict[str, Any] = {
@@ -2522,11 +2397,7 @@ def build_record(
             "migratable": False,
             "cache_passthrough": True,
             "battery_acpi": bool(battery["enabled"]),
-            "smbios_entry_point": {
-                "major": 3,
-                "minor": 5 if platform["memory_type"] == "ddr5" else 2,
-                "docrev": 0,
-            },
+            "smbios_entry_point": dict(ENTRY_POINT),
             "usb_hid": {
                 **deepcopy(secrets.choice(HID_CATALOG)),
                 "mouse_serial": identity["usb_mouse_serial"],
@@ -2534,6 +2405,7 @@ def build_record(
             },
         },
         "ovmf_policy": {
+            "flash_size_bytes": FIRMWARE_SIZE,
             "firmware_vendor": fw["vendor"],
             "firmware_version": fw["version"],
             "firmware_date": fw["date"],

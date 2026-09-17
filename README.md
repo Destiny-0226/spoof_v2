@@ -185,7 +185,7 @@ QEMU Git 树默认不携带 `keycodemapdb`，`02` 会根据上游 Meson wrap 的
 - QEMU：`git make python3 ninja meson pkg-config cc/gcc`
 - OVMF：`git make gcc g++ nasm python3 iasl qemu-img`
 
-身份文件当前 schema 为 24，宿主平台来源版本为 3。修改或重新运行 `01` 后，必须按顺序重新
+身份文件当前 schema 为 25，宿主平台来源版本为 3。修改或重新运行 `01` 后，必须按顺序重新
 运行 `02` 和 `03`；本次 QEMU 运行时前缀、OVMF Logo、Host Bridge DID 和南桥槽位对齐也要求
 重新运行 `02`、`03`。`04` 会拒绝混用不同 profile、旧运行时前缀或旧 Logo 的产物。
 
@@ -224,6 +224,19 @@ Host Bridge DID 是单一来源：`01` 写入 `devices.pci_identities.host_bridg
 某项数据，才在合理范围内生成。ACPI Creator ID/Revision 与 profile BIOS 厂商和日期保持一致。
 
 ## 已知边界
+
+### SMBIOS schema 25
+
+- `smbios_contract.py` 是四阶段共享的构造/校验模块，不是第五阶段。所有表都经过结构校验，且完整二进制必须等于 profile 的确定性构造结果。
+- 入口统一为 SMBIOS 3.5，Type 17 长度为 92 字节，声明 DRAM、volatile 工作能力及实装易失容量。额定速度、SPD 编码、Rank、电压缺少虚拟模块证据时保持未知；配置速度是 profile 声明值，不是性能测量。
+- Type 0 ROM 为实际构建约束的 4 MiB；OVMF 强制 `FD_SIZE_4MB` 并检查原始 CODE+VARS 容量。UEFI/虚拟机位据实设置，EC 修订号未知，不再声称未验证的传统 BIOS 功能。
+- 不把宿主汇总缓存直接声明为 Guest 缓存；当前省略 Type 7，Type 4 缓存引用为 FFFF（SMBIOS 2.3+ 的未提供缓存信息）。CPU ID 未采集时不填宿主未过滤的 CPUID；当前以零字节表示未报告，不能将它解释为实测 CPU 签名。CPU 厂商/型号保留 host-passthrough 模板，缓存/CPUID 的 Guest 实测采集仍需后续运行验证。
+- Type 9 保留平台槽位描述，但使用状态和 PCI 地址标记未知；宿主电压/温度/电流探针（26/28/29）不直接发布为 Guest 已实现传感器。捕获的宿主原始资料仍保留在 JSON。
+- XML 的部分启用 vCPU 或逐 CPU 热插拔状态不受固定模型支持，01/04 将拒绝，不悄悄生成全部启用的 CPU 表。
+- 必须明确重新运行 01 并重建 QEMU revision 33、OVMF revision 15 后才能应用。schema 24 及既有构建不会自动升级，也不会因为同步源码而改变现有 VM。
+- 源码/二进制回归不等于 Guest 启动验证。最终还需核对固件入口、Guest 原始 SMBIOS、CPUID、系统内存和 WMI/dmidecode；不能仅凭字段更多就认定合规。
+
+上述编码依据 [DMTF DSP0134](https://www.dmtf.org/sites/default/files/standards/documents/DSP0134_3.8.0.pdf)；4 MiB 构建选项来自 [EDK2 OVMF](https://github.com/tianocore/edk2/blob/edk2-stable202602/OvmfPkg/OvmfPkgX64.dsc)。
 
 - Q35/ICH9 是 QEMU 实际实现的芯片组，不会只改 PCI ID 就冒充新一代 PCH。Guest
   可见的非唯一身份（CPU 厂商/型号、DMI、ACPI OEM、南桥 PCI ID/槽位/ACPI 名、

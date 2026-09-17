@@ -22,7 +22,7 @@ SOURCE = RESOURCES / "qemu11backup"
 OUT = ROOT / "build" / "qemu"
 QEMU_URL = "https://gitlab.com/qemu-project/qemu.git"
 QEMU_REF = "v11.0.2"
-PATCH_REVISION = 32
+PATCH_REVISION = 33
 ACPI_NAMESEG_RE = re.compile(r"\A[A-Z_][A-Z0-9_]{3}\Z")
 QEMU_ACPI_TYPE_BY_ROLE = {
     "lpc": "ICH9-LPC",
@@ -2553,7 +2553,7 @@ FULL_SMBIOS_LOADER = r'''
 static bool smbios_load_full_file(const char *filename, Error **errp)
 {
     static const uint8_t required_types[] = {
-        0, 1, 2, 3, 4, 7, 11, 16, 17, 19, 20, 32, 127
+        0, 1, 2, 3, 4, 16, 17, 19, 20, 32, 127
     };
     DECLARE_BITMAP(seen, SMBIOS_MAX_TYPE + 1);
     g_autofree uint8_t *data = NULL;

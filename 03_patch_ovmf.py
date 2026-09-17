@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from smbios_memory import validate_record as validate_memory_record
+from smbios_contract import FIRMWARE_SIZE
 
 ROOT = Path(__file__).resolve().parent
 PROFILE_PATH = ROOT / "artifacts" / "identity-hardware.json"
@@ -21,7 +22,7 @@ SOURCE = RESOURCES / "ovmfbackup"
 OUT = ROOT / "build" / "ovmf"
 EDK2_URL = "https://github.com/tianocore/edk2.git"
 EDK2_REF = "edk2-stable202602"
-PATCH_REVISION = 14
+PATCH_REVISION = 15
 HOST_BGRT_IMAGE = Path("/sys/firmware/acpi/bgrt/image")
 
 TOOL_PACKAGES = {
@@ -280,12 +281,12 @@ def patch_source(source: Path, profile: dict) -> None:
     replace_once(dec, r'^\s*gEfiMdeModulePkgTokenSpaceGuid\.PcdAcpiDefaultCreatorRevision\|0x[0-9A-Fa-f]+', f'  gEfiMdeModulePkgTokenSpaceGuid.PcdAcpiDefaultCreatorRevision|0x{creator_revision:08X}', "ACPI creator revision")
 
     smbios = source / "OvmfPkg/SmbiosPlatformDxe/SmbiosPlatformDxe.c"
-    replace_once(smbios, r'0xE800, // UINT16\s+ BiosSegment', '0xE000, // UINT16                    BiosSegment', "SMBIOS BIOS segment")
-    replace_once(smbios, r'^\s*0,\s*// UINT8\s+ BiosSize', '  0xFF,   // UINT8                     BiosSize', "SMBIOS BIOS size")
+    replace_once(smbios, r'0xE800, // UINT16\s+ BiosSegment', '0,', "SMBIOS BIOS segment")
+    replace_once(smbios, r'^\s*0,\s*// UINT8\s+ BiosSize', '  0x3F,', "SMBIOS BIOS size")
     replace_once(
         smbios,
         r'^\s*0x1C // SystemReserved = VirtualMachineSupported \|\n\s*//\s+UefiSpecificationSupported \|\n\s*//\s+TargetContentDistributionEnabled',
-        '    0x0D // SystemReserved: BIOS boot, TCD and UEFI; VM bit clear',
+        '    0x18',
         "SMBIOS VM characteristic",
     )
     replace_once(smbios, r'^\s*0,\s*// UINT8\s+ SystemBiosMajorRelease', '  0xFF,  // UINT8                     SystemBiosMajorRelease', "SMBIOS BIOS major")
@@ -293,7 +294,7 @@ def patch_source(source: Path, profile: dict) -> None:
     replace_once(
         smbios,
         r'^\s*0xFF\s+// UINT8\s+ EmbeddedControllerFirmwareMinorRelease$',
-        '  0xFF,  // UINT8                     EmbeddedControllerFirmwareMinorRelease\n  { 16, 0 } // EXTENDED_BIOS_ROM_SIZE: 16 MiB',
+        '  0xFF,\n  { 0, 0 }',
         "SMBIOS extended BIOS size",
     )
 
@@ -454,7 +455,7 @@ def main() -> int:
     command = (
         "set -Eeo pipefail; "
         "source edksetup.sh; "
-        "build -D SMM_REQUIRE -D TPM1_ENABLE -D TPM2_ENABLE "
+        "build -D FD_SIZE_4MB -D SMM_REQUIRE -D TPM1_ENABLE -D TPM2_ENABLE "
         '-D FIRMWARE_VER="$OVO_FIRMWARE_VERSION" '
         f"-a X64 -p OvmfPkg/OvmfPkgX64.dsc -b RELEASE -t GCC5 -n {jobs} -s -q"
     )
@@ -470,6 +471,8 @@ def main() -> int:
             raise RuntimeError(f"OVMF 构建缺少 {path}")
 
     code_out = OUT / "OVMF_CODE_4M.patched.qcow2"
+    if code.stat().st_size + vars_file.stat().st_size != FIRMWARE_SIZE:
+        raise RuntimeError("OVMF CODE plus VARS size differs from the SMBIOS flash contract")
     vars_out = OUT / "OVMF_VARS_4M.patched.qcow2"
     run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2", str(code), str(code_out)])
     run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2", str(vars_file), str(vars_out)])
@@ -483,6 +486,7 @@ def main() -> int:
         "source": {"path": str(source), "ref": EDK2_REF, "revision": revision},
         "source_submodules": submodules,
         "secure_boot": False,
+        "flash_size_bytes": FIRMWARE_SIZE,
         "patches": ["profile-firmware-pcd", "profile-acpi-pcd", "profile-acpi-creator", "profile-q35-host-bridge-did", "profile-lpc-pmbase-devfn", "profile-cpu-hotplug-io", "secure-boot-disabled", "smbios-vm-bit-clear", "neutral-video-component", "neutral-hsti-publisher", "neutral-sio-component", "neutral-boot-variable", "neutral-fw-cfg-event"],
         "logo": logo,
         "tools": tools,

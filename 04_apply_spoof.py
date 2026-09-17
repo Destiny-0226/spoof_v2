@@ -125,6 +125,8 @@ def vcpu_count(root: ET.Element) -> int:
     if node is None or not (node.text and node.text.strip().isdigit()):
         raise ValueError("VM XML 缺少数字形式的 <vcpu>")
     count = int(node.text.strip())
+    if int(node.get("current", str(count)), 0) != count or root.find("vcpus") is not None:
+        raise ValueError("Fixed SMBIOS CPU topology does not support partial/hotplug vCPUs")
     if count < 1:
         raise ValueError("VM XML 的 vCPU 数量必须大于零")
     return count
@@ -554,12 +556,12 @@ def validate_build_outputs(profile: dict) -> None:
     builds = {
         "qemu": {
             "info": BUILD / "qemu" / "build-info.json",
-            "minimum_revision": 32,
+            "minimum_revision": 33,
             "products": ((BUILD / "qemu" / "bin" / "qemu-system-x86_64-ovo", "binary_sha256"),),
         },
         "ovmf": {
             "info": BUILD / "ovmf" / "build-info.json",
-            "minimum_revision": 14,
+            "minimum_revision": 15,
             "products": (
                 (BUILD / "ovmf" / "OVMF_CODE_4M.patched.qcow2", "code_sha256"),
                 (BUILD / "ovmf" / "OVMF_VARS_4M.patched.qcow2", "vars_sha256"),
@@ -585,6 +587,8 @@ def validate_build_outputs(profile: dict) -> None:
                 raise ValueError("QEMU 构建产物仍绑定旧的工作区路径，请重新运行 02_patch_qemu.py")
         if name == "ovmf" and info.get("secure_boot") is not False:
             raise ValueError("OVMF 构建产物未明确关闭 Secure Boot，请重新运行 03_patch_ovmf.py")
+        if name == "ovmf" and info.get("flash_size_bytes") != profile["ovmf_policy"]["flash_size_bytes"]:
+            raise ValueError("OVMF flash size does not match the SMBIOS profile")
         if int(info.get("patch_revision", 0)) < spec["minimum_revision"]:
             raise ValueError(f"{name} 构建产物版本过旧，请重新构建")
         for product, hash_key in spec["products"]:
