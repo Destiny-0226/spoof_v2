@@ -21,7 +21,7 @@ SOURCE = RESOURCES / "qemu11backup"
 OUT = ROOT / "build" / "qemu"
 QEMU_URL = "https://gitlab.com/qemu-project/qemu.git"
 QEMU_REF = "v11.0.2"
-PATCH_REVISION = 36
+PATCH_REVISION = 37
 IDENTITY_SCHEMA_VERSION = 28
 ARTIFACT_CONTRACT_VERSION = 1
 SMBIOS_END_MARKER = bytes((127, 4, 0xFF, 0xFE, 0, 0))
@@ -1533,6 +1533,21 @@ def patch_sata_capabilities(source: Path, profile: dict) -> None:
     if count < 1:
         raise RuntimeError("ATA UDMA capability marker not found")
     ide.write_text(text.replace(old, f"put_le16(p + 88, 0x{udma_word:04x}); /* profiled UDMA mode */"), encoding="utf-8")
+    # SET FEATURES 0x03 rewrites Word 88 after IDENTIFY. Keep the profiled
+    # capability mask so firmware cannot drop UDMA6 back to QEMU's UDMA5 default.
+    replace_literal(
+        ide,
+        "put_le16(identify_data + 88, 0x3f);",
+        f"put_le16(identify_data + 88, 0x{udma_supported:04x});",
+        "ATA SET FEATURES UDMA capability",
+        expected=3,
+    )
+    replace_literal(
+        ide,
+        "put_le16(identify_data + 88, 0x3f | (1 << (val + 8)));",
+        f"put_le16(identify_data + 88, 0x{udma_word:04x});",
+        "ATA SET FEATURES profiled UDMA mode",
+    )
 
 
 def profile_hda_pins(profile: dict) -> tuple[list[dict], list[dict]]:
@@ -3075,7 +3090,7 @@ def main() -> int:
         "platform_source_version": profile["meta"]["platform_source_version"],
         "platform_id": profile["meta"]["platform_id"],
         "storage_policy": profile["storage"]["policy"],
-        "patches": ["full-smbios-exclusive", "profile-acpi-identity", "profile-storage-identity", "profile-usb-hid-identity", "usb-serial-without-pci-path", "profile-audio-backend-if-present", "profile-onboard-hda-pins", "profile-pci-subsystem-identity", "profile-host-bridge-did", "profile-southbridge-devfn", "profile-southbridge-acpi-nodes", "profile-mce-banks", "profile-cpu-hotplug-io", "profile-vga-identity", "profile-root-port-identity", f"profile-{usb['capability_profile']}", "qemu-xhci-profile", "xhci-host-port-layout", "xhci-pm-interrupt-capabilities", "xhci-acpi-node", "intel-i226-v-device", "i226-nvm-mac-dsn-coherence", "i226-gpy-mdio-address-zero", "i226-i225-register-contract", "i226-rss-register-contract", "i226-four-descriptor-queues", "i226-2.5gbe-link", "i226-physical-pcie-layout", "i226-migration-state", "hide-fw-cfg-acpi", "clear-fadt-hypervisor-id", "normalize-acpi-topology", "normalize-madt-overrides", "publish-legacy-pit", "normalize-hpet-aml", "normalize-acpi-creator", "omit-acpi-debug-port", "omit-waet", "kvm-only-build", "stripped-runtime"],
+        "patches": ["full-smbios-exclusive", "profile-acpi-identity", "profile-storage-identity", "profile-usb-hid-identity", "usb-serial-without-pci-path", "profile-audio-backend-if-present", "profile-onboard-hda-pins", "profile-pci-subsystem-identity", "profile-host-bridge-did", "profile-southbridge-devfn", "profile-southbridge-acpi-nodes", "profile-mce-banks", "profile-cpu-hotplug-io", "profile-vga-identity", "profile-root-port-identity", f"profile-{usb['capability_profile']}", "qemu-xhci-profile", "xhci-host-port-layout", "xhci-pm-interrupt-capabilities", "xhci-acpi-node", "intel-i226-v-device", "i226-nvm-mac-dsn-coherence", "i226-gpy-mdio-address-zero", "i226-i225-register-contract", "i226-rss-register-contract", "i226-four-descriptor-queues", "i226-2.5gbe-link", "i226-physical-pcie-layout", "i226-migration-state", "hide-fw-cfg-acpi", "clear-fadt-hypervisor-id", "normalize-acpi-topology", "normalize-madt-overrides", "publish-legacy-pit", "normalize-hpet-aml", "normalize-acpi-creator", "omit-acpi-debug-port", "omit-waet", "kvm-only-build", "stripped-runtime", "profile-sata-udma-set-features"],
         "tools": tools,
         "binary": "bin/qemu-system-x86_64-ovo",
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),

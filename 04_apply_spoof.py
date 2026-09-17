@@ -654,12 +654,12 @@ def validate_build_outputs(profile: dict) -> None:
     builds = {
         "qemu": {
             "info": BUILD / "qemu" / "build-info.json",
-            "minimum_revision": 36,
+            "minimum_revision": 37,
             "products": ((BUILD / "qemu" / "bin" / "qemu-system-x86_64-ovo", "binary_sha256"),),
         },
         "ovmf": {
             "info": BUILD / "ovmf" / "build-info.json",
-            "minimum_revision": 16,
+            "minimum_revision": 17,
             "products": (
                 (BUILD / "ovmf" / "OVMF_CODE_4M.patched.qcow2", "code_sha256"),
                 (BUILD / "ovmf" / "OVMF_VARS_4M.patched.qcow2", "vars_sha256"),

@@ -20,7 +20,7 @@ SOURCE = RESOURCES / "ovmfbackup"
 OUT = ROOT / "build" / "ovmf"
 EDK2_URL = "https://github.com/tianocore/edk2.git"
 EDK2_REF = "edk2-stable202602"
-PATCH_REVISION = 16
+PATCH_REVISION = 17
 IDENTITY_SCHEMA_VERSION = 28
 ARTIFACT_CONTRACT_VERSION = 1
 SMBIOS_END_MARKER = bytes((127, 4, 0xFF, 0xFE, 0, 0))
@@ -444,6 +444,20 @@ def patch_source(source: Path, profile: dict) -> None:
             continue
         replace_once(path, re.escape(old), new, f"{rel} ISA bridge path")
 
+    sata = source / "MdeModulePkg/Bus/Pci/SataControllerDxe/SataController.c"
+    replace_once(
+        sata,
+        r"DeviceUDmaMode &= 0x3f;",
+        "DeviceUDmaMode &= 0x7f;",
+        "SATA UDMA6 Identify capability mask",
+    )
+    replace_once(
+        sata,
+        r"// Possible returned mode is between ATA_UDMA_MODE_0 and ATA_UDMA_MODE_5",
+        "// Possible returned mode is between ATA_UDMA_MODE_0 and ATA_UDMA_MODE_6",
+        "SATA UDMA6 mode range comment",
+    )
+
 
 def main() -> int:
     if not PROFILE_PATH.is_file() or not SMBIOS_PATH.is_file():
@@ -515,7 +529,7 @@ def main() -> int:
         "source_submodules": submodules,
         "secure_boot": False,
         "flash_size_bytes": firmware_size,
-        "patches": ["profile-firmware-pcd", "profile-acpi-pcd", "profile-acpi-creator", "profile-q35-host-bridge-did", "profile-lpc-pmbase-devfn", "profile-cpu-hotplug-io", "secure-boot-disabled", "smbios-vm-bit-clear", "neutral-video-component", "neutral-hsti-publisher", "neutral-sio-component", "neutral-boot-variable", "neutral-fw-cfg-event"],
+        "patches": ["profile-firmware-pcd", "profile-acpi-pcd", "profile-acpi-creator", "profile-q35-host-bridge-did", "profile-lpc-pmbase-devfn", "profile-cpu-hotplug-io", "secure-boot-disabled", "smbios-vm-bit-clear", "neutral-video-component", "neutral-hsti-publisher", "neutral-sio-component", "neutral-boot-variable", "neutral-fw-cfg-event", "sata-udma6-identify-mask"],
         "logo": logo,
         "tools": tools,
         "code": code_out.name,
