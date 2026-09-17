@@ -22,7 +22,7 @@ SOURCE = RESOURCES / "qemu11backup"
 OUT = ROOT / "build" / "qemu"
 QEMU_URL = "https://gitlab.com/qemu-project/qemu.git"
 QEMU_REF = "v11.0.2"
-PATCH_REVISION = 33
+PATCH_REVISION = 34
 ACPI_NAMESEG_RE = re.compile(r"\A[A-Z_][A-Z0-9_]{3}\Z")
 QEMU_ACPI_TYPE_BY_ROLE = {
     "lpc": "ICH9-LPC",
@@ -2660,7 +2660,72 @@ static bool smbios_load_full_file(const char *filename, Error **errp)
 '''
 
 
+FULL_SMBIOS_FINALIZE = r'''
+static bool smbios_full_finalize_cpuid(Error **errp)
+{
+    size_t offset = 0;
+    uint32_t version = cpu_to_le32(smbios_cpuid_version);
+    uint32_t features = cpu_to_le32(smbios_cpuid_features);
+
+    if (!smbios_cpuid_version) {
+        error_setg(errp, "guest CPUID is unavailable for SMBIOS");
+        return false;
+    }
+    while (offset < smbios_tables_len) {
+        size_t end;
+        struct smbios_structure_header *header;
+
+        if (smbios_tables_len - offset < sizeof(*header)) {
+            error_setg(errp, "truncated SMBIOS runtime header");
+            return false;
+        }
+        header = (struct smbios_structure_header *)(smbios_tables + offset);
+        if (header->length < sizeof(*header) ||
+            header->length > smbios_tables_len - offset) {
+            error_setg(errp, "invalid SMBIOS runtime structure length");
+            return false;
+        }
+        end = offset + header->length;
+        while (end + 1 < smbios_tables_len &&
+               (smbios_tables[end] || smbios_tables[end + 1])) {
+            end++;
+        }
+        if (end + 1 >= smbios_tables_len) {
+            error_setg(errp, "invalid SMBIOS runtime string terminator");
+            return false;
+        }
+        if (header->type == 4) {
+            static const uint8_t placeholder[8];
+
+            if (header->length < 16 ||
+                memcmp(smbios_tables + offset + 8, placeholder, 8)) {
+                error_setg(errp, "SMBIOS Processor ID must be a runtime placeholder");
+                return false;
+            }
+            memcpy(smbios_tables + offset + 8, &version, sizeof(version));
+            memcpy(smbios_tables + offset + 12, &features, sizeof(features));
+        }
+        offset = end + 2;
+    }
+    return true;
+}
+
+'''
+
+
 def patch_full_smbios(source: Path, profile: dict) -> None:
+    fw_cfg = source / "hw/i386/fw_cfg.c"
+    fw_text = fw_cfg.read_text(encoding="utf-8")
+    cpuid_marker = "    smbios_set_cpuid(cpu->env.cpuid_version, cpu->env.features[FEAT_1_EDX]);"
+    if fw_text.count(cpuid_marker) != 1:
+        raise RuntimeError("SMBIOS runtime CPUID source marker not found")
+    fw_text = fw_text.replace(cpuid_marker, (
+        "    uint32_t smbios_eax, smbios_ebx, smbios_ecx, smbios_edx;\n"
+        "    cpu_x86_cpuid(&cpu->env, 1, 0, &smbios_eax, &smbios_ebx,\n"
+        "                  &smbios_ecx, &smbios_edx);\n"
+        "    smbios_set_cpuid(smbios_eax, smbios_edx);"
+    ), 1)
+    fw_cfg.write_text(fw_text, encoding="utf-8")
     path = source / "hw/smbios/smbios.c"
     text = path.read_text(encoding="utf-8")
     marker = "static bool smbios_have_defaults;\n"
@@ -2671,7 +2736,7 @@ def patch_full_smbios(source: Path, profile: dict) -> None:
     marker = "static void save_opt(const char **dest, QemuOpts *opts, const char *name)\n"
     if text.count(marker) != 1:
         raise RuntimeError("SMBIOS loader insertion point not found")
-    text = text.replace(marker, FULL_SMBIOS_LOADER + marker, 1)
+    text = text.replace(marker, FULL_SMBIOS_LOADER + FULL_SMBIOS_FINALIZE + marker, 1)
 
     marker = "    val = qemu_opt_get(opts, \"file\");\n"
     replacement = (
@@ -2695,7 +2760,15 @@ def patch_full_smbios(source: Path, profile: dict) -> None:
     text = text.replace(marker, replacement, 1)
 
     marker = "    smbios_table_cnt = usr_table_cnt;\n\n"
-    replacement = marker + "    if (smbios_full_file) {\n        smbios_type4_count = smbios_full_type4_count;\n        goto tables_ready;\n    }\n\n"
+    replacement = marker + (
+        "    if (smbios_full_file) {\n"
+        "        if (!smbios_full_finalize_cpuid(errp)) {\n"
+        "            goto err_exit;\n"
+        "        }\n"
+        "        smbios_type4_count = smbios_full_type4_count;\n"
+        "        goto tables_ready;\n"
+        "    }\n\n"
+    )
     if text.count(marker) != 1:
         raise RuntimeError("SMBIOS table-copy marker not found")
     text = text.replace(marker, replacement, 1)

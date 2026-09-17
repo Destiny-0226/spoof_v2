@@ -317,7 +317,7 @@ def memory_bytes(root: ET.Element) -> int:
 def cpu_topology(root: ET.Element) -> dict[str, int]:
     vcpu_node = root.find("vcpu")
     vcpu = int((vcpu_node.text or "1").strip(), 0) if vcpu_node is not None else 1
-    if not 1 <= vcpu <= 65535:
+    if not 1 <= vcpu <= 65534:
         raise ValueError("Invalid fixed vCPU count")
     if vcpu_node is not None and int(vcpu_node.get("current", str(vcpu)), 0) != vcpu:
         raise ValueError("Fixed CPU model requires current vCPUs to equal maximum vCPUs")

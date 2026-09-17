@@ -35,6 +35,7 @@ def configure_guest_profile(profile: dict) -> dict:
         memory_max_voltage=0, memory_configured_voltage=0,
         cpu_voltage=0, cpu_external_clock_mhz=0,
         cpu_signature=0, cpu_features_edx=0,
+        cpu_id_policy="qemu-runtime-cpuid-leaf1",
     )
     characteristics = 0x04
     if result["cores"] > 1:
@@ -52,7 +53,7 @@ def validate_profile(profile: dict) -> None:
     cores = profile["cores"]
     enabled = profile["enabled_cores"]
     threads = profile["threads"]
-    if not all(type(value) is int and 1 <= value <= 65535 for value in (sockets, cores, enabled, threads)):
+    if not all(type(value) is int and 1 <= value <= 65534 for value in (sockets, cores, enabled, threads)):
         raise ValueError("Invalid SMBIOS CPU counts")
     if sockets > 256 or enabled != cores or threads < enabled or threads % cores:
         raise ValueError("Unsupported CPU socket/core/thread topology")
@@ -63,12 +64,32 @@ def validate_profile(profile: dict) -> None:
         raise ValueError("Processor characteristics do not match guest topology")
     if profile["cpu_voltage"] != 0 or profile["cpu_external_clock_mhz"] != 0:
         raise ValueError("Guest CPU electrical measurements are unavailable")
+    if profile.get("cpu_id_policy") != "qemu-runtime-cpuid-leaf1":
+        raise ValueError("Processor ID requires QEMU runtime CPUID finalization")
     if profile["cpu_signature"] != 0 or profile["cpu_features_edx"] != 0:
-        raise ValueError("Guest CPUID must not be inferred from unfiltered host CPUID")
+        raise ValueError("Processor ID template must reserve eight zero bytes for QEMU")
     for key in ("cpu_max_mhz", "cpu_current_mhz"):
         if not 0 < profile[key] <= 65535:
             raise ValueError("CPU speed is outside the SMBIOS field range")
     datetime.strptime(profile["bios_date"], "%m/%d/%Y")
+
+
+def validate_guest_stream(record: dict, data: bytes, cpuid: tuple[int, int]) -> None:
+    if (len(cpuid) != 2 or not all(type(value) is int and 0 <= value <= 0xFFFFFFFF for value in cpuid)
+            or cpuid[0] == 0):
+        raise ValueError("Independent guest CPUID(1).EAX/EDX evidence is required")
+    expected = bytearray(build_smbios_stream(
+        record["smbios_profile"], record["hardware"]["platform"], record["identity"],
+    ))
+    offset = 0
+    while offset < len(expected):
+        kind, length, handle = struct.unpack_from("<BBH", expected, offset)
+        if kind == 4:
+            struct.pack_into("<II", expected, offset + 8, *cpuid)
+        offset = expected.index(b"\0\0", offset + length) + 2
+    validate_tables(data, record["smbios_profile"])
+    if data != bytes(expected):
+        raise ValueError("Guest SMBIOS differs outside the verified runtime CPUID fields")
 
 
 def parse_tables(data: bytes) -> list[tuple[int, int, bytes, list[bytes]]]:
