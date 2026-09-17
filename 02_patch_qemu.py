@@ -2529,6 +2529,7 @@ def patch_acpi_identity(source: Path, profile: dict) -> None:
 FULL_SMBIOS_GLOBALS = r'''
 static bool smbios_full_file;
 static unsigned smbios_full_type4_count;
+static bool smbios_full_finalize_cpuid(Error **errp);
 
 static bool smbios_full_type_can_repeat(uint8_t type)
 {
