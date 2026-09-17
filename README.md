@@ -46,14 +46,15 @@ I226-V 是统一的独立 PCIe 网卡。
 缺少必需宿主事实、遇到未实现的内存类型或功能设备形态时直接失败，不生成
 另一品牌、另一平台或通用设备 fallback。
 
-内存生成和校验共用 `smbios_memory.py`，仍通过原来的 01→02/03→04 操作，
-没有第五阶段。当前只支持单内存阵列、1～16 槽、4 GiB 整数倍且不超过
+内存和完整 SMBIOS 的生成、深度校验都由 `01_generate_identity.py` 内部完成；
+`02/03/04` 只校验并消费 `identity-hardware.json` 与 `smbios.bin`，没有额外 Python
+模块或第五阶段。当前只支持单内存阵列、1～16 槽、4 GiB 整数倍且不超过
 512 GiB 的固定 Guest RAM；`currentMemory` 如存在须等于 `memory`。
 热插拔内存、Guest NUMA、自定义 QEMU 内存/机器参数等可能改变地址映射的
 配置会明确拒绝，不静默改写 XML。该限制不把 Type 16 平台上限改成 512 GiB。
 Type 19 的 RAM 区间与 Q35 内存别名布局一致，并非 OS 可用内存统计；固件和
 设备保留空间仍可能使 Guest 的“可用内存”少于已安装容量。
-schema 23 旧产物不会被原地升级：需要明确重新运行 01，再重建 02/03，
+schema 26 旧产物不会被原地升级：需要明确重新运行 01，再重建 02/03，
 最后按原流程预览并应用 04。仅更新源码不会修改现有身份、运行时固件或虚拟机。
 
 ## 使用顺序
@@ -185,7 +186,7 @@ QEMU Git 树默认不携带 `keycodemapdb`，`02` 会根据上游 Meson wrap 的
 - QEMU：`git make python3 ninja meson pkg-config cc/gcc`
 - OVMF：`git make gcc g++ nasm python3 iasl qemu-img`
 
-身份文件当前 schema 为 26，宿主平台来源版本为 3。修改或重新运行 `01` 后，必须按顺序重新
+身份文件当前 schema 为 27，宿主平台来源版本为 3。修改或重新运行 `01` 后，必须按顺序重新
 运行 `02` 和 `03`；本次 QEMU 运行时前缀、OVMF Logo、Host Bridge DID 和南桥槽位对齐也要求
 重新运行 `02`、`03`。`04` 会拒绝混用不同 profile、旧运行时前缀或旧 Logo 的产物。
 
@@ -225,16 +226,16 @@ Host Bridge DID 是单一来源：`01` 写入 `devices.pci_identities.host_bridg
 
 ## 已知边界
 
-### SMBIOS schema 26
+### SMBIOS schema 27
 
-- `smbios_contract.py` 是四阶段共享的构造/校验模块，不是第五阶段。所有表都经过结构校验，且完整二进制必须等于 profile 的确定性构造结果。Type 127 使用 OVMF 最终分配的保留句柄 `0xFEFF`，因此模板与来宾最终表无需再做句柄替换。
+- `01_generate_identity.py` 是 SMBIOS 的唯一生成和深度校验入口。schema 27 在身份文件中记录身份载荷哈希及 `smbios.bin` 的路径、哈希、大小、入口、Type 127 句柄和 CPU ID 填充策略；`02/03/04` 不再重建 SMBIOS。Type 127 使用 OVMF 最终分配的保留句柄 `0xFEFF`。
 - 入口统一为 SMBIOS 3.5，Type 17 长度为 92 字节，声明 DRAM、volatile 工作能力及实装易失容量。额定速度、SPD 编码、Rank、电压缺少虚拟模块证据时保持未知；配置速度是 profile 声明值，不是性能测量。
 - Type 0 ROM 为实际构建约束的 4 MiB；OVMF 强制 `FD_SIZE_4MB` 并检查原始 CODE+VARS 容量。UEFI/虚拟机位据实设置，EC 修订号未知，不再声称未验证的传统 BIOS 功能。
 - 不把宿主汇总缓存直接声明为 Guest 缓存；当前省略 Type 7，Type 4 缓存引用为 FFFF（SMBIOS 2.3+ 的未提供缓存信息）。磁盘模板的 CPU ID 八字节为运行时占位，不是标准“未知”编码；QEMU 在发布给固件前以 Guest CPUID(1).EAX/EDX 填入每个 Type 4，取不到则拒绝启动。CPU 厂商/型号保留 host-passthrough 模板。
 - 磁盘模板校验与 Guest 最终表校验分开。\`validate_guest_stream\` 要求独立采集的 Guest CPUID，只允许这八字节的受控变化；不能拿模板哈希直接要求最终表逐字节相等。Guest 缓存实测尚未接入，明确保持未知。
 - Type 9 保留平台槽位描述，但使用状态和 PCI 地址标记未知；宿主电压/温度/电流探针（26/28/29）不直接发布为 Guest 已实现传感器。捕获的宿主原始资料仍保留在 JSON。
 - XML 的部分启用 vCPU 或逐 CPU 热插拔状态不受固定模型支持，01/04 将拒绝，不悄悄生成全部启用的 CPU 表。
-- 必须明确重新运行 01 并重建 QEMU revision 34、OVMF revision 15 后才能应用。schema 24 及既有构建不会自动升级，也不会因为同步源码而改变现有 VM。
+- 必须明确重新运行 01 并重建 QEMU revision 35、OVMF revision 16 后才能应用。schema 26 及既有构建不会自动升级，也不会因为同步源码而改变现有 VM。
 - 源码/二进制回归不等于 Guest 启动验证。最终还需核对固件入口、Guest 原始 SMBIOS、CPUID、系统内存和 WMI/dmidecode；不能仅凭字段更多就认定合规。
 
 上述编码依据 [DMTF DSP0134](https://www.dmtf.org/sites/default/files/standards/documents/DSP0134_3.8.0.pdf)；4 MiB 构建选项来自 [EDK2 OVMF](https://github.com/tianocore/edk2/blob/edk2-stable202602/OvmfPkg/OvmfPkgX64.dsc)。

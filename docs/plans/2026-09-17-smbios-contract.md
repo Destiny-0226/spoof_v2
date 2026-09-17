@@ -25,6 +25,7 @@
 5. Review the diff, commit only task files, push and fast-forward the clean remote to the exact commit. Run regression tests there; preserve existing identity and build artifacts.
 6. Document the tested commit and remaining guest runtime checks. A pure Python test does not prove CPUID, firmware entry-point or guest WMI behavior.
 7. Align the template Type 127 handle with OVMF's final `0xFEFF` allocation, reject alternate terminator handles and bump the generated identity contract to schema 26.
+8. Consolidate SMBIOS generation and deep validation into phase 01, publish the immutable artifact contract as schema 27 and remove the two shared Python modules.
 
 ## Reference
 

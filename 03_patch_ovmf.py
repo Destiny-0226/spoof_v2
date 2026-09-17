@@ -12,17 +12,18 @@ import subprocess
 import sys
 from pathlib import Path
 
-from smbios_memory import validate_record as validate_memory_record
-from smbios_contract import FIRMWARE_SIZE
-
 ROOT = Path(__file__).resolve().parent
 PROFILE_PATH = ROOT / "artifacts" / "identity-hardware.json"
+SMBIOS_PATH = ROOT / "artifacts" / "smbios.bin"
 RESOURCES = ROOT / "resources"
 SOURCE = RESOURCES / "ovmfbackup"
 OUT = ROOT / "build" / "ovmf"
 EDK2_URL = "https://github.com/tianocore/edk2.git"
 EDK2_REF = "edk2-stable202602"
-PATCH_REVISION = 15
+PATCH_REVISION = 16
+IDENTITY_SCHEMA_VERSION = 27
+ARTIFACT_CONTRACT_VERSION = 1
+SMBIOS_END_MARKER = bytes((127, 4, 0xFF, 0xFE, 0, 0))
 HOST_BGRT_IMAGE = Path("/sys/firmware/acpi/bgrt/image")
 
 TOOL_PACKAGES = {
@@ -40,6 +41,32 @@ TOOL_PACKAGES = {
         "python3": "python3", "iasl": "acpica-tools", "qemu-img": "qemu-img",
     },
 }
+
+
+def validate_artifact_contract(profile: dict, smbios: bytes) -> None:
+    try:
+        payload = {key: value for key, value in profile.items() if key != "artifacts"}
+        payload_hash = hashlib.sha256(json.dumps(
+            payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        artifacts = profile["artifacts"]
+        smbios_info = artifacts["smbios"]
+        valid = (
+            profile["meta"]["schema_version"] == IDENTITY_SCHEMA_VERSION
+            and artifacts["contract_version"] == ARTIFACT_CONTRACT_VERSION
+            and artifacts["identity_payload_sha256"] == payload_hash
+            and smbios_info["path"] == "smbios.bin"
+            and smbios_info["sha256"] == hashlib.sha256(smbios).hexdigest()
+            and smbios_info["size_bytes"] == len(smbios)
+            and smbios_info["entry_point"] == profile["qemu_policy"]["smbios_entry_point"]
+            and smbios_info["end_of_table_handle"] == 0xFEFF
+            and smbios_info["cpu_id_policy"] == profile["smbios_profile"]["cpu_id_policy"]
+            and smbios.endswith(SMBIOS_END_MARKER)
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("身份文件的 schema 27 产物契约不完整，请重新运行 01") from error
+    if not valid:
+        raise ValueError("identity-hardware.json 或 smbios.bin 已改变，请重新运行 01")
 
 
 def run(command: list[str], cwd: Path | None = None, *, capture: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -419,10 +446,10 @@ def patch_source(source: Path, profile: dict) -> None:
 
 
 def main() -> int:
-    if not PROFILE_PATH.is_file():
-        raise RuntimeError("缺少 artifacts/identity-hardware.json，请先运行 01_generate_identity.py")
+    if not PROFILE_PATH.is_file() or not SMBIOS_PATH.is_file():
+        raise RuntimeError("缺少 identity-hardware.json 或 smbios.bin，请先运行 01_generate_identity.py")
     profile = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
-    validate_memory_record(profile, (ROOT / "artifacts/smbios.bin").read_bytes())
+    validate_artifact_contract(profile, SMBIOS_PATH.read_bytes())
     if (
         profile.get("meta", {}).get("platform_source") != "host-non-unique"
         or int(profile.get("meta", {}).get("platform_source_version", 0)) != 3
@@ -431,6 +458,7 @@ def main() -> int:
         raise RuntimeError("身份文件缺少宿主非唯一平台来源信息")
     if profile.get("ovmf_policy", {}).get("secure_boot") is not False:
         raise RuntimeError("当前管理策略要求明确关闭 Secure Boot")
+    firmware_size = int(profile["ovmf_policy"]["flash_size_bytes"])
 
     tools = require_tools(("git", "make", "gcc", "g++", "nasm", "python3", "iasl", "qemu-img"))
     source = ensure_source()
@@ -471,7 +499,7 @@ def main() -> int:
             raise RuntimeError(f"OVMF 构建缺少 {path}")
 
     code_out = OUT / "OVMF_CODE_4M.patched.qcow2"
-    if code.stat().st_size + vars_file.stat().st_size != FIRMWARE_SIZE:
+    if code.stat().st_size + vars_file.stat().st_size != firmware_size:
         raise RuntimeError("OVMF CODE plus VARS size differs from the SMBIOS flash contract")
     vars_out = OUT / "OVMF_VARS_4M.patched.qcow2"
     run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2", str(code), str(code_out)])
@@ -486,7 +514,7 @@ def main() -> int:
         "source": {"path": str(source), "ref": EDK2_REF, "revision": revision},
         "source_submodules": submodules,
         "secure_boot": False,
-        "flash_size_bytes": FIRMWARE_SIZE,
+        "flash_size_bytes": firmware_size,
         "patches": ["profile-firmware-pcd", "profile-acpi-pcd", "profile-acpi-creator", "profile-q35-host-bridge-did", "profile-lpc-pmbase-devfn", "profile-cpu-hotplug-io", "secure-boot-disabled", "smbios-vm-bit-clear", "neutral-video-component", "neutral-hsti-publisher", "neutral-sio-component", "neutral-boot-variable", "neutral-fw-cfg-event"],
         "logo": logo,
         "tools": tools,

@@ -26,8 +26,6 @@ from datetime import datetime
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from smbios_memory import validate_record as validate_memory_record, xml_memory_bytes
-
 ROOT = Path(__file__).resolve().parent
 ARTIFACTS = ROOT / "artifacts"
 PROFILE_PATH = ARTIFACTS / "identity-hardware.json"
@@ -36,6 +34,10 @@ BACKUPS = ROOT / "backups"
 QEMU_NS = "http://libvirt.org/schemas/domain/qemu/1.0"
 RUNTIME_ROOT = Path("/opt/ovo-spoof/profiles")
 ET.register_namespace("qemu", QEMU_NS)
+IDENTITY_SCHEMA_VERSION = 27
+ARTIFACT_CONTRACT_VERSION = 1
+SMBIOS_END_MARKER = bytes((127, 4, 0xFF, 0xFE, 0, 0))
+GIB = 1024**3
 
 I226_NETWORK_IDENTITY = {
     "model": "i226-v",
@@ -58,6 +60,78 @@ I226_NETWORK_IDENTITY = {
     "firmware_version": "2017:888d",
 }
 I226_EXTENDED_CAPABILITIES = ["aer-v2", "dsn", "ltr", "l1-pm-substates", "ptm"]
+
+
+def validate_artifact_contract(profile: dict, smbios: bytes) -> None:
+    try:
+        payload = {key: value for key, value in profile.items() if key != "artifacts"}
+        payload_hash = hashlib.sha256(json.dumps(
+            payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        artifacts = profile["artifacts"]
+        smbios_info = artifacts["smbios"]
+        valid = (
+            profile["meta"]["schema_version"] == IDENTITY_SCHEMA_VERSION
+            and artifacts["contract_version"] == ARTIFACT_CONTRACT_VERSION
+            and artifacts["identity_payload_sha256"] == payload_hash
+            and smbios_info["path"] == "smbios.bin"
+            and smbios_info["sha256"] == hashlib.sha256(smbios).hexdigest()
+            and smbios_info["size_bytes"] == len(smbios)
+            and smbios_info["entry_point"] == profile["qemu_policy"]["smbios_entry_point"]
+            and smbios_info["end_of_table_handle"] == 0xFEFF
+            and smbios_info["cpu_id_policy"] == profile["smbios_profile"]["cpu_id_policy"]
+            and smbios.endswith(SMBIOS_END_MARKER)
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("身份文件的 schema 27 产物契约不完整，请重新运行 01") from error
+    if not valid:
+        raise ValueError("identity-hardware.json 或 smbios.bin 已改变，请重新运行 01")
+
+
+def xml_memory_bytes(root: ET.Element) -> int:
+    units = {
+        "b": 1, "bytes": 1, "kb": 1000, "kib": 1024,
+        "mb": 1000**2, "mib": 1024**2, "gb": 1000**3, "gib": GIB,
+    }
+
+    def read_size(node: ET.Element | None) -> int:
+        if node is None or not (node.text or "").strip():
+            raise ValueError("XML 缺少明确的内存容量")
+        unit = node.get("unit", "KiB").lower()
+        if unit not in units:
+            raise ValueError(f"不支持的内存单位: {unit}")
+        return int(node.text.strip(), 0) * units[unit]
+
+    total = read_size(root.find("memory"))
+    if total < 4 * GIB or total % (4 * GIB) or total > 512 * GIB:
+        raise ValueError("Guest 内存必须为 4-512 GiB 范围内 4 GiB 的整数倍")
+    current = root.find("currentMemory")
+    if current is not None and read_size(current) != total:
+        raise ValueError("固定内存模型要求 currentMemory 与 memory 相等")
+    if any(root.find(path) is not None for path in (
+            "maxMemory", "./devices/memory", "./cpu/numa",
+            "./devices/controller[@model='pcie-expander-bus']")):
+        raise ValueError("当前内存模型不支持热插拔内存、自定义 NUMA 或扩展 PCIe 总线布局")
+    namespace = "{http://libvirt.org/schemas/domain/qemu/1.0}"
+    arguments = [
+        node.get("value", "")
+        for node in root.findall(f"./{namespace}commandline/{namespace}arg")
+    ]
+    forbidden = {"-m", "-M", "-machine", "-numa", "-readconfig", "-set", "-incoming"}
+    fragments = (
+        "max-ram-below-4g", "sgx-epc", "memory-backend", "pc-dimm", "nvdimm",
+        "virtio-mem", "cxl", "pci-hole64-size",
+    )
+    if any(
+            value.split("=", 1)[0] in forbidden
+            or any(fragment in value.lower() for fragment in fragments)
+            for value in arguments):
+        raise ValueError("QEMU 自定义参数可能改变固定内存映射，当前不支持")
+    if root.find(f"./{namespace}override") is not None:
+        raise ValueError("固定内存模型暂不接受 QEMU 属性 override")
+    if root.find("./cpu/maxphysaddr") is not None:
+        raise ValueError("固定内存模型暂不接受自定义 maxphysaddr")
+    return total
 
 
 def run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -271,7 +345,6 @@ def load_artifacts() -> tuple[dict, bytes]:
     if not profile_path.exists() or not smbios_path.exists():
         raise FileNotFoundError("缺少 identity-hardware.json 或 smbios.bin，请先运行 01_generate_identity.py")
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
-    validate_memory_record(profile)
     if (
         profile.get("meta", {}).get("platform_source") != "host-non-unique"
         or int(profile.get("meta", {}).get("platform_source_version", 0)) != 3
@@ -281,11 +354,7 @@ def load_artifacts() -> tuple[dict, bytes]:
     if profile.get("ovmf_policy", {}).get("secure_boot") is not False:
         raise ValueError("当前身份文件未明确关闭 Secure Boot，请重新运行 01_generate_identity.py")
     smbios = smbios_path.read_bytes()
-    expected = profile.get("artifacts", {}).get("smbios_sha256")
-    actual = hashlib.sha256(smbios).hexdigest()
-    if expected != actual:
-        raise ValueError("smbios.bin 与 identity-hardware.json 不匹配")
-    validate_memory_record(profile, smbios)
+    validate_artifact_contract(profile, smbios)
     if profile.get("source", {}).get("domain") is None:
         raise ValueError("身份文件缺少源虚拟机名称")
     if profile.get("hardware", {}).get("audio", {}).get("xml_policy") != "onboard-hda" or profile.get("xml_policy", {}).get("audio") != "onboard-hda":
@@ -556,12 +625,12 @@ def validate_build_outputs(profile: dict) -> None:
     builds = {
         "qemu": {
             "info": BUILD / "qemu" / "build-info.json",
-            "minimum_revision": 34,
+            "minimum_revision": 35,
             "products": ((BUILD / "qemu" / "bin" / "qemu-system-x86_64-ovo", "binary_sha256"),),
         },
         "ovmf": {
             "info": BUILD / "ovmf" / "build-info.json",
-            "minimum_revision": 15,
+            "minimum_revision": 16,
             "products": (
                 (BUILD / "ovmf" / "OVMF_CODE_4M.patched.qcow2", "code_sha256"),
                 (BUILD / "ovmf" / "OVMF_VARS_4M.patched.qcow2", "vars_sha256"),

@@ -13,16 +13,18 @@ import subprocess
 import sys
 from pathlib import Path
 
-from smbios_memory import validate_record as validate_memory_record
-
 ROOT = Path(__file__).resolve().parent
 PROFILE_PATH = ROOT / "artifacts" / "identity-hardware.json"
+SMBIOS_PATH = ROOT / "artifacts" / "smbios.bin"
 RESOURCES = ROOT / "resources"
 SOURCE = RESOURCES / "qemu11backup"
 OUT = ROOT / "build" / "qemu"
 QEMU_URL = "https://gitlab.com/qemu-project/qemu.git"
 QEMU_REF = "v11.0.2"
-PATCH_REVISION = 34
+PATCH_REVISION = 35
+IDENTITY_SCHEMA_VERSION = 27
+ARTIFACT_CONTRACT_VERSION = 1
+SMBIOS_END_MARKER = bytes((127, 4, 0xFF, 0xFE, 0, 0))
 ACPI_NAMESEG_RE = re.compile(r"\A[A-Z_][A-Z0-9_]{3}\Z")
 QEMU_ACPI_TYPE_BY_ROLE = {
     "lpc": "ICH9-LPC",
@@ -30,6 +32,33 @@ QEMU_ACPI_TYPE_BY_ROLE = {
     "sata": "ich9-ahci",
     "usb": "qemu-xhci",
 }
+
+
+def validate_artifact_contract(profile: dict, smbios: bytes) -> None:
+    try:
+        payload = {key: value for key, value in profile.items() if key != "artifacts"}
+        payload_hash = hashlib.sha256(json.dumps(
+            payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        artifacts = profile["artifacts"]
+        smbios_info = artifacts["smbios"]
+        valid = (
+            profile["meta"]["schema_version"] == IDENTITY_SCHEMA_VERSION
+            and artifacts["contract_version"] == ARTIFACT_CONTRACT_VERSION
+            and artifacts["identity_payload_sha256"] == payload_hash
+            and smbios_info["path"] == "smbios.bin"
+            and smbios_info["sha256"] == hashlib.sha256(smbios).hexdigest()
+            and smbios_info["size_bytes"] == len(smbios)
+            and smbios_info["entry_point"] == profile["qemu_policy"]["smbios_entry_point"]
+            and smbios_info["end_of_table_handle"] == 0xFEFF
+            and smbios_info["cpu_id_policy"] == profile["smbios_profile"]["cpu_id_policy"]
+            and smbios.endswith(SMBIOS_END_MARKER)
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("身份文件的 schema 27 产物契约不完整，请重新运行 01") from error
+    if not valid:
+        raise ValueError("identity-hardware.json 或 smbios.bin 已改变，请重新运行 01")
+
 
 TOOL_PACKAGES = {
     "pacman": {
@@ -2866,10 +2895,10 @@ def build_battery_table(profile: dict) -> Path | None:
 
 
 def main() -> int:
-    if not PROFILE_PATH.is_file():
-        raise RuntimeError("缺少 artifacts/identity-hardware.json，请先运行 01_generate_identity.py")
+    if not PROFILE_PATH.is_file() or not SMBIOS_PATH.is_file():
+        raise RuntimeError("缺少 identity-hardware.json 或 smbios.bin，请先运行 01_generate_identity.py")
     profile = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
-    validate_memory_record(profile, (ROOT / "artifacts/smbios.bin").read_bytes())
+    validate_artifact_contract(profile, SMBIOS_PATH.read_bytes())
     if (
         profile.get("meta", {}).get("platform_source") != "host-non-unique"
         or int(profile.get("meta", {}).get("platform_source_version", 0)) != 3
