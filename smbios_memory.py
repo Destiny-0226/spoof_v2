@@ -8,7 +8,7 @@ from xml.etree import ElementTree as ET
 
 MIB = 1024**2
 GIB = 1024**3
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 MEMORY_LAYOUT = "q35-fixed-sequential-v1"
 
 
@@ -233,7 +233,7 @@ def validate_stream(data: bytes, profile: dict, platform: dict, identity: dict) 
 def validate_record(record: dict, data: bytes | None = None) -> None:
     try:
         if record["meta"]["schema_version"] != SCHEMA_VERSION:
-            raise ValueError("身份文件需要 schema 25，请重新运行 01 并重建 02/03")
+            raise ValueError("身份文件需要 schema 26，请重新运行 01 并重建 02/03")
         profile = record["smbios_profile"]
         memory = record["hardware"]["memory"]
         host_memory = record["host"]["smbios_non_unique"]["memory"]

@@ -20,10 +20,11 @@
 
 1. Reproduce non-memory mutations accepted by schema 24 using `.remote/verify_full_smbios.py` against the remote baseline; keep artifacts byte-identical.
 2. Extract stream construction to `smbios_contract.py`; add strict parsing, supported-layout validation and whole-stream/profile checks. Wire all four phases through the existing shared validation entry point.
-3. Update `smbios_memory.py` and phase 01 for schema 25, modern memory fields, explicit unknown values and virtual platform policy. Update phase 03 to enforce 4 MiB firmware and phase 04's build revision requirement.
+3. Introduce schema 25 in `smbios_memory.py` and phase 01 for modern memory fields, explicit unknown values and virtual platform policy. Update phase 03 to enforce 4 MiB firmware and phase 04's build revision requirement.
 4. Extend private remote tests with independent structure decoding, all-table mutations, malformed strings/references, stale schema rejection, empty slots and multiple CPU sockets. Do not add a new test framework to this repository.
 5. Review the diff, commit only task files, push and fast-forward the clean remote to the exact commit. Run regression tests there; preserve existing identity and build artifacts.
 6. Document the tested commit and remaining guest runtime checks. A pure Python test does not prove CPUID, firmware entry-point or guest WMI behavior.
+7. Align the template Type 127 handle with OVMF's final `0xFEFF` allocation, reject alternate terminator handles and bump the generated identity contract to schema 26.
 
 ## Reference
 

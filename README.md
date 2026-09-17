@@ -185,7 +185,7 @@ QEMU Git 树默认不携带 `keycodemapdb`，`02` 会根据上游 Meson wrap 的
 - QEMU：`git make python3 ninja meson pkg-config cc/gcc`
 - OVMF：`git make gcc g++ nasm python3 iasl qemu-img`
 
-身份文件当前 schema 为 25，宿主平台来源版本为 3。修改或重新运行 `01` 后，必须按顺序重新
+身份文件当前 schema 为 26，宿主平台来源版本为 3。修改或重新运行 `01` 后，必须按顺序重新
 运行 `02` 和 `03`；本次 QEMU 运行时前缀、OVMF Logo、Host Bridge DID 和南桥槽位对齐也要求
 重新运行 `02`、`03`。`04` 会拒绝混用不同 profile、旧运行时前缀或旧 Logo 的产物。
 
@@ -225,9 +225,9 @@ Host Bridge DID 是单一来源：`01` 写入 `devices.pci_identities.host_bridg
 
 ## 已知边界
 
-### SMBIOS schema 25
+### SMBIOS schema 26
 
-- `smbios_contract.py` 是四阶段共享的构造/校验模块，不是第五阶段。所有表都经过结构校验，且完整二进制必须等于 profile 的确定性构造结果。
+- `smbios_contract.py` 是四阶段共享的构造/校验模块，不是第五阶段。所有表都经过结构校验，且完整二进制必须等于 profile 的确定性构造结果。Type 127 使用 OVMF 最终分配的保留句柄 `0xFEFF`，因此模板与来宾最终表无需再做句柄替换。
 - 入口统一为 SMBIOS 3.5，Type 17 长度为 92 字节，声明 DRAM、volatile 工作能力及实装易失容量。额定速度、SPD 编码、Rank、电压缺少虚拟模块证据时保持未知；配置速度是 profile 声明值，不是性能测量。
 - Type 0 ROM 为实际构建约束的 4 MiB；OVMF 强制 `FD_SIZE_4MB` 并检查原始 CODE+VARS 容量。UEFI/虚拟机位据实设置，EC 修订号未知，不再声称未验证的传统 BIOS 功能。
 - 不把宿主汇总缓存直接声明为 Guest 缓存；当前省略 Type 7，Type 4 缓存引用为 FFFF（SMBIOS 2.3+ 的未提供缓存信息）。磁盘模板的 CPU ID 八字节为运行时占位，不是标准“未知”编码；QEMU 在发布给固件前以 Guest CPUID(1).EAX/EDX 填入每个 Type 4，取不到则拒绝启动。CPU 厂商/型号保留 host-passthrough 模板。

@@ -9,10 +9,11 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Iterable
 
-from smbios_memory import memory_tables, validate_stream
+from smbios_memory import SCHEMA_VERSION, memory_tables, validate_stream
 
 FIRMWARE_SIZE = 4 * 1024**2
 ENTRY_POINT = {"major": 3, "minor": 5, "docrev": 0}
+END_OF_TABLE_HANDLE = 0xFEFF
 
 
 def guest_slot_body(body: bytes) -> bytes:
@@ -29,7 +30,7 @@ def guest_slot_body(body: bytes) -> bytes:
 def configure_guest_profile(profile: dict) -> dict:
     result = deepcopy(profile)
     result.update(
-        schema=25, cache_policy="unknown-until-guest-observed",
+        schema=SCHEMA_VERSION, cache_policy="unknown-until-guest-observed",
         cache_l1_kib=None, cache_l2_kib=None, cache_l3_kib=None,
         memory_rated_speed=0, memory_min_voltage=0,
         memory_max_voltage=0, memory_configured_voltage=0,
@@ -47,8 +48,9 @@ def configure_guest_profile(profile: dict) -> dict:
 
 
 def validate_profile(profile: dict) -> None:
-    if profile.get("schema") != 25 or profile.get("cache_policy") != "unknown-until-guest-observed":
-        raise ValueError("SMBIOS profile requires schema 25 and explicit guest cache policy")
+    if profile.get("schema") != SCHEMA_VERSION or profile.get("cache_policy") != "unknown-until-guest-observed":
+        raise ValueError(
+            f"SMBIOS profile requires schema {SCHEMA_VERSION} and explicit guest cache policy")
     sockets = profile["sockets"]
     cores = profile["cores"]
     enabled = profile["enabled_cores"]
@@ -112,7 +114,8 @@ def parse_tables(data: bytes) -> list[tuple[int, int, bytes, list[bytes]]]:
         handles.add(handle)
         tables.append((kind, handle, data[offset:offset + length], strings))
         offset = end + 2
-        if kind == 127 and (length != 4 or strings or offset != len(data)):
+        if kind == 127 and (
+                length != 4 or handle != END_OF_TABLE_HANDLE or strings or offset != len(data)):
             raise ValueError("Invalid end-of-table structure")
     if not tables or tables[-1][0] != 127:
         raise ValueError("Missing end-of-table structure")
@@ -300,9 +303,9 @@ def build_smbios_stream(profile: dict, platform: dict, identity: dict) -> bytes:
         ]))
 
     out.append(smbios_structure(32, 0x2000, bytes(7)))
-    out.append(smbios_structure(127, 0x7F00, b""))
+    out.append(smbios_structure(127, END_OF_TABLE_HANDLE, b""))
     data = b"".join(out)
-    if not data.endswith(struct.pack("<BBH", 127, 4, 0x7F00) + b"\0\0"):
+    if not data.endswith(struct.pack("<BBH", 127, 4, END_OF_TABLE_HANDLE) + b"\0\0"):
         raise ValueError("SMBIOS stream has no valid Type 127 terminator")
     validate_smbios_memory_topology(data, profile, platform, identity)
     validate_tables(data, profile)
