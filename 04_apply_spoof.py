@@ -34,7 +34,7 @@ BACKUPS = ROOT / "backups"
 QEMU_NS = "http://libvirt.org/schemas/domain/qemu/1.0"
 RUNTIME_ROOT = Path("/opt/ovo-spoof/profiles")
 ET.register_namespace("qemu", QEMU_NS)
-IDENTITY_SCHEMA_VERSION = 28
+IDENTITY_SCHEMA_VERSION = 32
 ARTIFACT_CONTRACT_VERSION = 1
 SMBIOS_END_MARKER = bytes((127, 4, 0xFF, 0xFE, 0, 0))
 GIB = 1024**3
@@ -83,7 +83,7 @@ def validate_artifact_contract(profile: dict, smbios: bytes) -> None:
             and smbios.endswith(SMBIOS_END_MARKER)
         )
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("身份文件的 schema 28 产物契约不完整，请重新运行 01") from error
+        raise ValueError(f"身份文件的 schema {IDENTITY_SCHEMA_VERSION} 产物契约不完整，请重新运行 01") from error
     if not valid:
         raise ValueError("identity-hardware.json 或 smbios.bin 已改变，请重新运行 01")
 
@@ -357,11 +357,14 @@ def load_artifacts() -> tuple[dict, bytes]:
     validate_artifact_contract(profile, smbios)
     if profile.get("source", {}).get("domain") is None:
         raise ValueError("身份文件缺少源虚拟机名称")
-    if profile.get("hardware", {}).get("audio", {}).get("xml_policy") != "onboard-hda" or profile.get("xml_policy", {}).get("audio") != "onboard-hda":
-        raise ValueError("身份文件未声明板载 HDA 策略")
+    audio_policy = profile.get("hardware", {}).get("audio", {}).get("xml_policy")
+    if audio_policy not in {"onboard-hda", "none"} or profile.get("xml_policy", {}).get("audio") != audio_policy:
+        raise ValueError("身份文件的音频策略必须是芯片组 HDA 或 none")
     validate_inherited_platform(profile)
     primary = profile.get("devices", {}).get("pci_identities", {})
-    required_primary = {"host_bridge", "lpc", "smbus", "sata", "root_port", "vga", "hda"}
+    required_primary = {"host_bridge", "lpc", "smbus", "sata", "root_port", "vga"}
+    if audio_policy == "onboard-hda":
+        required_primary.add("hda")
     if not required_primary.issubset(primary):
         raise ValueError("身份文件缺少南桥/Root Port/VGA 主 PCI 身份，请重新运行 01_generate_identity.py")
     if not primary.get("root_ports"):
@@ -413,7 +416,18 @@ def load_artifacts() -> tuple[dict, bytes]:
         raise ValueError(f"xHCI 与 {occupied[usb_key]} 占用同一 PCI 地址")
     validate_network_identity(profile)
     validate_usb_identity(profile)
-    validate_audio_identity(profile)
+    if audio_policy == "onboard-hda":
+        validate_audio_identity(profile)
+        hda_address = (primary.get("hda") or {}).get("pci_address") or {}
+        try:
+            hda_key = (int(hda_address["slot"], 0), int(hda_address["function"], 0))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("身份文件缺少板载 HDA PCI 槽位") from exc
+        if hda_key in occupied:
+            raise ValueError(f"板载 HDA 与 {occupied[hda_key]} 占用同一 PCI 地址")
+        occupied[hda_key] = "hda"
+    elif primary.get("hda"):
+        raise ValueError("无板载 analog HDA 时不应写入 HDA PCI 身份")
     validate_cpu_platform_identity(profile)
     validate_storage_identity(profile)
     return profile, smbios
@@ -498,15 +512,20 @@ def validate_storage_identity(profile: dict) -> None:
     serial = str(disk.get("serial", ""))
     try:
         serial_length = int(identity["serial_length"])
+        pattern = str(identity["serial_pattern"])
+        oui = str(identity["wwn_oui"]).lower()
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("SATA SSD 缺少序列号长度规则") from exc
-    if len(serial) != serial_length or not re.fullmatch(r"[A-Z0-9]{12,20}", serial):
-        raise ValueError("SATA SSD 序列号格式无效")
-    if not serial.startswith(str(identity.get("serial_prefix", ""))):
-        raise ValueError("SATA SSD 序列号与随机配件族不匹配")
+        raise ValueError("SATA SSD 缺少序列号或 WWN 结构规则") from exc
+    if len(serial) != serial_length or not pattern or not re.fullmatch(pattern, serial):
+        raise ValueError("SATA SSD 序列号与随机配件族规则不匹配")
     wwn = str(disk.get("wwn", ""))
-    if not re.fullmatch(r"[0-9A-F]{16}", wwn) or not wwn.lower().startswith(str(identity.get("wwn_prefix", "")).lower()):
-        raise ValueError("SATA SSD WWN 与随机配件族不匹配")
+    if (
+        not re.fullmatch(r"[0-9A-F]{16}", wwn)
+        or not re.fullmatch(r"[0-9a-f]{6}", oui)
+        or wwn[0] != "5"
+        or wwn[1:7].lower() != oui
+    ):
+        raise ValueError("SATA SSD WWN 与随机配件族 OUI 不匹配")
     controller = profile.get("hardware", {}).get("storage_controller") or {}
     if controller.get("media_policy") != "sata-ssd-only" or controller.get("ncq") is not True:
         raise ValueError("AHCI 控制器没有绑定 SATA SSD/NCQ 策略")
@@ -654,7 +673,7 @@ def validate_build_outputs(profile: dict) -> None:
     builds = {
         "qemu": {
             "info": BUILD / "qemu" / "build-info.json",
-            "minimum_revision": 37,
+            "minimum_revision": 40,
             "products": ((BUILD / "qemu" / "bin" / "qemu-system-x86_64-ovo", "binary_sha256"),),
         },
         "ovmf": {
@@ -912,21 +931,20 @@ def set_cpu_and_clock(root: ET.Element, profile: dict, effective_vcpus: int) -> 
     })
     ET.SubElement(cpu, "cache", {"mode": "passthrough"})
     ET.SubElement(cpu, "feature", {"policy": "disable", "name": "hypervisor"})
+    ET.SubElement(cpu, "feature", {"policy": "require", "name": "invtsc"})
     host_flags = set(profile["host"]["cpu"].get("flags", ()))
     for host_name, libvirt_name in (
         ("x2apic", "x2apic"),
         ("stibp", "stibp"),
-        ("ssbd", "ssbd"),
     ):
         if host_name in host_flags:
             ET.SubElement(cpu, "feature", {"policy": "require", "name": libvirt_name})
     if host_flags & {"spec_ctrl", "ibrs", "ibrs_enhanced"}:
         ET.SubElement(cpu, "feature", {"policy": "require", "name": "spec-ctrl"})
     if profile["host"]["cpu"]["vendor"] == "AuthenticAMD":
-        ET.SubElement(cpu, "feature", {"policy": "require", "name": "svm"})
         ET.SubElement(cpu, "feature", {"policy": "require", "name": "topoext"})
-    else:
-        ET.SubElement(cpu, "feature", {"policy": "require", "name": "vmx"})
+    for name in ("vmx", "svm", "ssbd", "vmx-vnmi"):
+        ET.SubElement(cpu, "feature", {"policy": "disable", "name": name})
     cpu_index = list(root).index(root.find("features")) + 1 if root.find("features") is not None else 0
     root.insert(cpu_index, cpu)
 
@@ -1026,7 +1044,7 @@ def normalize_pcie_root_ports(devices: ET.Element) -> None:
     used_buses = {
         bus
         for node in devices
-        if node.tag != "controller"
+        if not (node.tag == "controller" and node.get("type") == "pci")
         for bus in (pci_bus_number(node),)
         if bus is not None
     }
@@ -1079,62 +1097,198 @@ def normalize_pcie_root_ports(devices: ET.Element) -> None:
             target.set("hotplug", "off")
 
 
+ROOT_PORT_ROLE_ORDER = ("gpu", "nvme", "nic", "usb", "audio", "other", "empty")
+
+
+def pci_class_role(class_code: int) -> str:
+    if (class_code >> 16) & 0xFF == 0x03:
+        return "gpu"
+    if (class_code >> 8) & 0xFFFF == 0x0108:
+        return "nvme"
+    if (class_code >> 16) & 0xFF == 0x02:
+        return "nic"
+    if (class_code >> 8) & 0xFFFF == 0x0c03:
+        return "usb"
+    if (class_code >> 8) & 0xFFFF == 0x0403:
+        return "audio"
+    return "other"
+
+
+def preferred_root_port_role(roles: list[str]) -> str:
+    if not roles:
+        return "empty"
+    return min(
+        roles,
+        key=lambda role: ROOT_PORT_ROLE_ORDER.index(role) if role in ROOT_PORT_ROLE_ORDER else len(ROOT_PORT_ROLE_ORDER),
+    )
+
+
+def classify_hostdev_role(node: ET.Element) -> str:
+    if node.get("type") != "pci":
+        return "usb" if node.get("type") == "usb" else "other"
+    source = node.find("source/address")
+    if source is None:
+        return "other"
+    try:
+        bdf = (
+            f"{int(source.get('domain', '0'), 0):04x}:"
+            f"{int(source.get('bus', '0'), 0):02x}:"
+            f"{int(source.get('slot', '0'), 0):02x}."
+            f"{int(source.get('function', '0'), 0)}"
+        )
+    except ValueError:
+        return "other"
+    path = Path("/sys/bus/pci/devices") / bdf / "class"
+    try:
+        value = path.read_text().strip()
+        class_code = int(value, 16 if value.lower().startswith("0x") else 10)
+    except (OSError, ValueError):
+        return "other"
+    if class_code <= 0:
+        return "other"
+    return pci_class_role(class_code)
+
+
+def classify_guest_endpoint(node: ET.Element) -> str | None:
+    if node.tag == "controller":
+        model = node.get("model")
+        kind = node.get("type")
+        if kind == "pci" or model in {"pcie-root", "pcie-root-port", "pcie-to-pci-bridge", "pci-bridge"}:
+            return None
+        if kind == "usb":
+            return "usb"
+        return "other"
+    if node.tag == "interface":
+        return "nic"
+    if node.tag == "video":
+        return "gpu"
+    if node.tag == "sound":
+        return "audio"
+    if node.tag == "hostdev":
+        return classify_hostdev_role(node)
+    if node.tag == "disk":
+        target = node.find("target")
+        bus = (target.get("bus") if target is not None else "") or ""
+        if bus == "nvme" or node.get("type") == "nvme":
+            return "nvme"
+        return "other"
+    address = node.find("address")
+    if address is None or address.get("type") != "pci":
+        return None
+    return "other"
+
+
+def guest_root_port_role(devices: ET.Element, bus_index: int) -> str:
+    roles = [
+        role
+        for node in devices
+        if pci_bus_number(node) == bus_index
+        for role in (classify_guest_endpoint(node),)
+        if role
+    ]
+    return preferred_root_port_role(roles)
+
+
 def validate_profiled_root_ports(devices: ET.Element, profile: dict) -> None:
-    profiled = {
-        int(item["guest_target_port"])
-        for item in profile["devices"]["pci_identities"]["root_ports"]
-    }
+    profiled_items = profile["devices"]["pci_identities"]["root_ports"]
+    profiled = {}
+    for item in profiled_items:
+        try:
+            port = int(item["guest_target_port"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("身份文件 Root Port 缺少 guest_target_port") from exc
+        if port in profiled:
+            raise ValueError(f"身份文件 Root Port target port 重复: {port:#x}")
+        if not item.get("guest_role") or not item.get("mapping_reason"):
+            raise ValueError("身份文件 Root Port 缺少下游角色映射，请重新运行 01_generate_identity.py")
+        profiled[port] = item
     actual: set[int] = set()
     for controller in devices.findall("controller"):
         if controller.get("type") != "pci" or controller.get("model") != "pcie-root-port":
             continue
         target = controller.find("target")
         try:
-            actual.add(int(target.get("port", ""), 0) if target is not None else -1)
+            port = int(target.get("port", ""), 0) if target is not None else -1
+            index = int(controller.get("index", "0"), 0)
         except ValueError as exc:
             raise ValueError("PCIe Root Port target port 无效") from exc
-    missing = sorted(actual - profiled)
+        actual.add(port)
+        item = profiled.get(port)
+        if item is None:
+            continue
+        actual_role = guest_root_port_role(devices, index)
+        expected = item.get("guest_role")
+        if actual_role != expected:
+            # 04 disables emulated xHCI when there is no USB hostdev, so a port
+            # that 01 classified as usb becomes empty after normalize.
+            if expected == "usb" and actual_role == "empty":
+                continue
+            raise ValueError(
+                f"PCIe Root Port 0x{port:02x} 下游是 {actual_role}，"
+                f"身份按 {expected} 映射，请重新运行 01_generate_identity.py"
+            )
+    missing = sorted(actual - set(profiled))
     if missing:
         values = ", ".join(f"0x{port:02x}" for port in missing)
         raise ValueError(f"最终 XML 包含未建档的 PCIe Root Port: {values}")
 
 
-def normalize_onboard_hda(devices: ET.Element, profile: dict) -> None:
-    """Drop libvirt <sound> so Q35's reserved 1f.3 SMBus slot is not collided.
+def pci_address_tuple(node: ET.Element) -> tuple[int, int, int] | None:
+    address = node.find("address")
+    if address is None or address.get("type") != "pci":
+        return None
+    try:
+        return (
+            int(address.get("bus", "0"), 0),
+            int(address.get("slot", "0"), 0),
+            int(address.get("function", "0"), 0),
+        )
+    except ValueError:
+        return None
 
-    The actual ich9-intel-hda device is attached later via qemu:commandline at
-    the host-observed BDF.  Spice/none audio backends stay as <audio> nodes.
+
+def is_libvirt_ich9_sound(node: ET.Element) -> bool:
+    return node.get("model") in {None, "ich9"}
+
+
+def generated_hda_device_arg(value: str) -> bool:
+    """Match chipset HDA args this script owns, including the previous sound0 ids."""
+    if value in {"ich9-intel-hda,id=hda", "ich9-intel-hda,id=sound0"}:
+        return True
+    return value.startswith((
+        "ich9-intel-hda,id=hda,",
+        "ich9-intel-hda,id=sound0",
+        "hda-duplex,id=hda-codec0",
+        "hda-output,id=hda-codec0",
+        "hda-duplex,id=sound0-codec0",
+        "hda-output,id=sound0-codec0",
+    ))
+
+
+def normalize_onboard_hda(devices: ET.Element, profile: dict) -> None:
+    """Remove libvirt's ich9 <sound> card so chipset HDA can occupy the host BDF.
+
+    USB/other sound devices stay under user control.  Playback backends stay
+    as <audio> nodes.  The ich9 controller itself is attached later via
+    qemu:commandline because libvirt still reserves stock Q35 1f.3 for SMBus.
     """
-    audio = profile["hardware"]["audio"]
+    audio = profile.get("hardware", {}).get("audio") or {}
+    if audio.get("xml_policy") != "onboard-hda":
+        return
     wanted = audio["pci_address"]
     wanted_bus = int(wanted["bus"], 0)
     wanted_slot = int(wanted["slot"], 0)
     wanted_function = int(wanted["function"], 0)
-    sounds = devices.findall("sound")
-    if len(sounds) > 1:
-        raise ValueError("当前 XML 存在多块虚拟声卡，请先只保留板载 ich9-hda")
-    if sounds and sounds[0].get("model") not in {None, "ich9"}:
-        raise ValueError(f"当前声卡型号是 {sounds[0].get('model')!r}，板载 HDA 后端只承载 ich9")
+    wanted_tuple = (wanted_bus, wanted_slot, wanted_function)
+    for sound in list(devices.findall("sound")):
+        if is_libvirt_ich9_sound(sound):
+            devices.remove(sound)
     for node in list(devices):
-        if node.tag == "sound":
-            continue
-        address = node.find("address")
-        if address is None or address.get("type") != "pci":
-            continue
-        try:
-            occupied = (
-                int(address.get("bus", "0"), 0),
-                int(address.get("slot", "0"), 0),
-                int(address.get("function", "0"), 0),
-            )
-        except ValueError:
-            continue
-        if occupied == (wanted_bus, wanted_slot, wanted_function):
+        occupied = pci_address_tuple(node)
+        if occupied == wanted_tuple:
             raise ValueError(
                 f"PCI 00:{wanted_slot:02x}.{wanted_function} 已被其他设备占用，无法放置板载 HDA"
             )
-    for sound in sounds:
-        devices.remove(sound)
 
 
 def pci_hostdev_bdfs(devices: ET.Element) -> list[str]:
@@ -1426,7 +1580,7 @@ def set_qemu_commandline(
         node = children[index]
         value = node.get("value", "") if node.tag == arg_tag else ""
         generated_acpi = value == "-acpitable"
-        generated_hda = value == "-device" and index + 1 < len(children) and children[index + 1].get("value", "").startswith(("ich9-intel-hda,id=sound0", "hda-duplex,id=sound0-codec0", "hda-output,id=sound0-codec0"))
+        generated_hda = value == "-device" and index + 1 < len(children) and generated_hda_device_arg(children[index + 1].get("value", ""))
         if value == "-smbios" or generated_acpi or generated_hda:
             index += 2
             continue
@@ -1450,7 +1604,9 @@ def set_qemu_commandline(
 
 
 def attach_onboard_hda_commandline(commandline: ET.Element, root: ET.Element, profile: dict, arg_tag: str) -> None:
-    audio = profile["hardware"]["audio"]
+    audio = profile.get("hardware", {}).get("audio") or {}
+    if audio.get("xml_policy") != "onboard-hda":
+        return
     address = audio["pci_address"]
     bus = int(address["bus"], 0)
     slot = int(address["slot"], 0)
@@ -1468,8 +1624,8 @@ def attach_onboard_hda_commandline(commandline: ET.Element, root: ET.Element, pr
         if backend is not None and backend.get("id"):
             audio_id = backend.get("id")
     ET.SubElement(commandline, arg_tag, {"value": "-device"})
-    ET.SubElement(commandline, arg_tag, {"value": f"ich9-intel-hda,id=sound0,addr=0x{slot:02x}.{function}"})
-    codec_value = f"{codec},id=sound0-codec0,bus=sound0.0,cad={cad}"
+    ET.SubElement(commandline, arg_tag, {"value": f"ich9-intel-hda,id=hda,addr=0x{slot:02x}.{function}"})
+    codec_value = f"{codec},id=hda-codec0,bus=hda.0,cad={cad}"
     if audio_id is not None:
         codec_value += f",audiodev=audio{audio_id}"
     ET.SubElement(commandline, arg_tag, {"value": "-device"})

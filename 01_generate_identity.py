@@ -34,7 +34,7 @@ from xml.etree import ElementTree as ET
 
 MIB = 1024**2
 GIB = 1024**3
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 32
 MEMORY_LAYOUT = "q35-fixed-sequential-v1"
 ARTIFACT_CONTRACT_VERSION = 1
 
@@ -201,8 +201,14 @@ def memory_tables(profile: dict, platform: dict, identity: dict) -> list[bytes]:
             raise ValueError("Memory speed is outside the SMBIOS range")
         voltages = [int(profile[key]) if installed else 0 for key in
                     ("memory_min_voltage", "memory_max_voltage", "memory_configured_voltage")]
-        if any(value != 0 for value in voltages) or rated != 0:
-            raise ValueError("Unobserved virtual DIMM electrical/rated values must remain unknown")
+        if installed:
+            if rated != speed:
+                raise ValueError("Rated memory speed must match configured speed")
+            if not all(800 <= value <= 2000 for value in voltages):
+                raise ValueError("DIMM voltage is outside the SMBIOS millivolt range")
+        elif rated != 0 or any(value != 0 for value in voltages):
+            raise ValueError("Empty DIMM slots must not advertise electrical values")
+        mfg_id = memory_jedec_id(profile["memory_vendor"]) if installed else 0
         body = struct.pack(
             "<5H5B2H5BI4H", 0x1000, 0xFFFE, 64 if installed else 0xFFFF,
             64 if installed else 0xFFFF, size_field, slot["form_factor"], 0, 1, 2,
@@ -212,7 +218,7 @@ def memory_tables(profile: dict, platform: dict, identity: dict) -> list[bytes]:
         )
         body += struct.pack(
             "<BHB4H4Q2I", 3 if installed else 2, 8 if installed else 4,
-            0, 0, 0, 0, 0, 0, size * MIB, 0, 0, 0,
+            0, mfg_id, 0, 0, 0, 0, size * MIB, 0, 0, 0,
             speed if speed >= 0xFFFF else 0,
         )
         strings = [slot["device_locator"], slot["bank_locator"]]
@@ -260,7 +266,7 @@ def validate_stream(data: bytes, profile: dict, platform: dict, identity: dict) 
 def validate_memory_record(record: dict, data: bytes | None = None) -> None:
     try:
         if record["meta"]["schema_version"] != SCHEMA_VERSION:
-            raise ValueError("身份文件需要 schema 28，请重新运行 01 并重建 02/03")
+            raise ValueError(f"身份文件需要 schema {SCHEMA_VERSION}，请重新运行 01 并重建 02/03")
         profile = record["smbios_profile"]
         memory = record["hardware"]["memory"]
         host_memory = record["host"]["smbios_non_unique"]["memory"]
@@ -320,14 +326,50 @@ def guest_slot_body(body: bytes) -> bytes:
     return bytes(result)
 
 
+def memory_jedec_id(vendor: str) -> int:
+    """SMBIOS Type 17 Module Manufacturer ID: LSB = continuation count, MSB = JEP106 ID."""
+    name = vendor.lower()
+    mapping = (
+        ("samsung", 0xCE00),
+        ("hynix", 0xAD00),
+        ("micron", 0x2C00),
+        ("crucial", 0x2C00),
+        ("kingston", 0x9801),
+        ("corsair", 0x9E01),
+        ("adata", 0xCB01),
+    )
+    for token, code in mapping:
+        if token in name:
+            return code
+    return 0
+
+
+def dimm_jedec_voltage_mv(memory_type: str) -> int:
+    if "ddr4" in memory_type:
+        return 1200
+    return 1100
+
+
+def smbios_cpu_voltage_byte(raw: int) -> int:
+    if raw & 0x80 and 5 <= (raw & 0x7F) <= 20:
+        return raw
+    return 0x8C
+
+
 def configure_guest_profile(profile: dict) -> dict:
     result = deepcopy(profile)
+    speed = int(result["memory_speed"])
+    millivolts = dimm_jedec_voltage_mv(str(result.get("memory_type") or ""))
+    host_clock = int(result.get("cpu_external_clock_mhz") or 0)
     result.update(
         schema=SCHEMA_VERSION, cache_policy="unknown-until-guest-observed",
         cache_l1_kib=None, cache_l2_kib=None, cache_l3_kib=None,
-        memory_rated_speed=0, memory_min_voltage=0,
-        memory_max_voltage=0, memory_configured_voltage=0,
-        cpu_voltage=0, cpu_external_clock_mhz=0,
+        memory_rated_speed=speed,
+        memory_min_voltage=millivolts,
+        memory_max_voltage=millivolts,
+        memory_configured_voltage=millivolts,
+        cpu_voltage=smbios_cpu_voltage_byte(int(result.get("cpu_voltage") or 0)),
+        cpu_external_clock_mhz=host_clock if 10 <= host_clock <= 400 else 100,
         cpu_signature=0, cpu_features_edx=0,
         cpu_id_policy="qemu-runtime-cpuid-leaf1",
     )
@@ -357,8 +399,17 @@ def validate_profile(profile: dict) -> None:
     expected = 4 | (8 if cores > 1 else 0) | (16 if threads > cores else 0)
     if profile["cpu_characteristics"] != expected:
         raise ValueError("Processor characteristics do not match guest topology")
-    if profile["cpu_voltage"] != 0 or profile["cpu_external_clock_mhz"] != 0:
-        raise ValueError("Guest CPU electrical measurements are unavailable")
+    if not (10 <= int(profile["cpu_external_clock_mhz"]) <= 400):
+        raise ValueError("CPU external clock is outside the SMBIOS field range")
+    voltage = int(profile["cpu_voltage"])
+    if not (voltage & 0x80) or not (5 <= (voltage & 0x7F) <= 20):
+        raise ValueError("CPU voltage must use the current-voltage SMBIOS encoding")
+    speed = int(profile["memory_speed"])
+    if int(profile["memory_rated_speed"]) != speed:
+        raise ValueError("Rated memory speed must match configured speed")
+    for key in ("memory_min_voltage", "memory_max_voltage", "memory_configured_voltage"):
+        if not 800 <= int(profile[key]) <= 2000:
+            raise ValueError("DIMM voltage is outside the SMBIOS millivolt range")
     if profile.get("cpu_id_policy") != "qemu-runtime-cpuid-leaf1":
         raise ValueError("Processor ID requires QEMU runtime CPUID finalization")
     if profile["cpu_signature"] != 0 or profile["cpu_features_edx"] != 0:
@@ -680,42 +731,133 @@ ROUTER_OUIS = (
 MEMORY_CATALOG: dict[tuple[str, str], dict[int, tuple[tuple[str, str], ...]]] = {
     ("ddr5", "laptop"): {
         4096: (("Samsung", "M425R512GB4-CQK"),),
-        8192: (("Samsung", "M425R1GB4BB0-CQK"), ("Micron", "MTC4C10163S1SC48BA1"), ("SK hynix", "HMCG66MEBSA095N")),
-        16384: (("Samsung", "M425R2GA3BB0-CQK"), ("Micron", "MTC8C1084S1SC48BA1"), ("SK hynix", "HMCG78MEBSA095N")),
-        32768: (("Samsung", "M425R4GA3BB0-CQK"), ("SK hynix", "HMCG88MEBSA092N")),
+        8192: (
+            ("Samsung", "M425R1GB4BB0-CQK"), ("Samsung", "M425R1GB4PB0-CWM"),
+            ("Micron", "MTC4C10163S1SC48BA1"), ("SK hynix", "HMCG66MEBSA095N"),
+            ("Crucial", "CT8G48C40S5"), ("Kingston", "KF548S38IB-8"),
+            ("Corsair", "CMSX8GX5M1A4800C40"),
+        ),
+        16384: (
+            ("Samsung", "M425R2GA3BB0-CQK"), ("Samsung", "M425R2GA3PB0-CWM"),
+            ("Micron", "MTC8C1084S1SC48BA1"), ("SK hynix", "HMCG78MEBSA095N"),
+            ("Crucial", "CT16G48C40S5"), ("Kingston", "KF548S38IB-16"),
+            ("Corsair", "CMSX16GX5M1A4800C40"),
+        ),
+        32768: (
+            ("Samsung", "M425R4GA3BB0-CQK"), ("SK hynix", "HMCG88MEBSA092N"),
+            ("Micron", "MTC16C2084S1SC48BA1"), ("Crucial", "CT32G48C40S5"),
+            ("Kingston", "KF548S38IB-32"), ("Corsair", "CMSX32GX5M1A4800C40"),
+        ),
     },
     ("ddr5", "desktop"): {
         4096: (("Samsung", "M323R512GB4-CQK"),),
-        8192: (("Samsung", "M323R1GB4BB0-CQK"), ("Crucial", "CT8G48C40U5"), ("Kingston", "KF548C38BB-8")),
-        16384: (("Samsung", "M323R2GA3BB0-CQK"), ("Crucial", "CT16G48C40U5"), ("Kingston", "KF552C40BB-16")),
-        32768: (("Samsung", "M323R4GA3BB0-CQK"), ("Crucial", "CT32G48C40U5"), ("Kingston", "KF560C36BBE-32")),
-        65536: (("Crucial", "CT64G48C40U5"), ("Kingston", "KF560C32RSA-64")),
+        8192: (
+            ("Samsung", "M323R1GB4BB0-CQK"), ("Crucial", "CT8G48C40U5"),
+            ("Kingston", "KF548C38BB-8"), ("Corsair", "CMK8GX5M1B5200C40"),
+            ("ADATA", "AD5U48008G-B"),
+        ),
+        16384: (
+            ("Samsung", "M323R2GA3BB0-CQK"), ("Crucial", "CT16G48C40U5"),
+            ("Kingston", "KF552C40BB-16"), ("Corsair", "CMK16GX5M1B5200C40"),
+            ("ADATA", "AD5U480016G-B"),
+        ),
+        32768: (
+            ("Samsung", "M323R4GA3BB0-CQK"), ("Crucial", "CT32G48C40U5"),
+            ("Kingston", "KF560C36BBE-32"), ("Corsair", "CMK32GX5M1B5200C40"),
+            ("ADATA", "AD5U480032G-B"),
+        ),
+        65536: (
+            ("Crucial", "CT64G48C40U5"), ("Kingston", "KF560C32RSA-64"),
+            ("Corsair", "CMK64GX5M1B5200C40"),
+        ),
     },
     ("ddr4", "laptop"): {
-        4096: (("Samsung", "M471A5244CB0-CWE"), ("SK hynix", "HMA851S6CJR6N-XN")),
-        8192: (("Samsung", "M471A1K43EB1-CWE"), ("Crucial", "CT8G4SFRA32A"), ("SK hynix", "HMA81GS6DJR8N-XN")),
-        16384: (("Samsung", "M471A2K43EB1-CWE"), ("Crucial", "CT16G4SFRA32A"), ("SK hynix", "HMA82GS6DJR8N-XN")),
-        32768: (("Samsung", "M471A4G43AB1-CWE"), ("Crucial", "CT32G4SFD832A")),
+        4096: (
+            ("Samsung", "M471A5244CB0-CWE"), ("SK hynix", "HMA851S6CJR6N-XN"),
+            ("Kingston", "KVR32S22S6/4"),
+        ),
+        8192: (
+            ("Samsung", "M471A1K43EB1-CWE"), ("Crucial", "CT8G4SFRA32A"),
+            ("SK hynix", "HMA81GS6DJR8N-XN"), ("Kingston", "KVR32S22S8/8"),
+            ("Micron", "MTA8ATF1G64HZ-3G2E1"),
+        ),
+        16384: (
+            ("Samsung", "M471A2K43EB1-CWE"), ("Crucial", "CT16G4SFRA32A"),
+            ("SK hynix", "HMA82GS6DJR8N-XN"), ("Kingston", "KVR32S22D8/16"),
+            ("Micron", "MTA16ATF2G64HZ-3G2E1"),
+        ),
+        32768: (
+            ("Samsung", "M471A4G43AB1-CWE"), ("Crucial", "CT32G4SFD832A"),
+            ("Kingston", "KVR32S22D8/32"), ("SK hynix", "HMAA4GS6CJR8N-XN"),
+        ),
     },
     ("ddr4", "desktop"): {
         4096: (("Samsung", "M378A5244CB0-CWE"), ("Kingston", "KVR32N22S6/4")),
-        8192: (("Samsung", "M378A1K43EB1-CWE"), ("Crucial", "CT8G4DFRA32A"), ("Kingston", "KVR32N22S8/8")),
-        16384: (("Samsung", "M378A2K43EB1-CWE"), ("Crucial", "CT16G4DFRA32A"), ("Kingston", "KVR32N22D8/16")),
-        32768: (("Samsung", "M378A4G43AB2-CWE"), ("Crucial", "CT32G4DFD832A"), ("Kingston", "KVR32N22D8/32")),
+        8192: (
+            ("Samsung", "M378A1K43EB1-CWE"), ("Crucial", "CT8G4DFRA32A"),
+            ("Kingston", "KVR32N22S8/8"), ("ADATA", "AD4U32008G22-SGN"),
+        ),
+        16384: (
+            ("Samsung", "M378A2K43EB1-CWE"), ("Crucial", "CT16G4DFRA32A"),
+            ("Kingston", "KVR32N22D8/16"), ("ADATA", "AD4U320016G22-SGN"),
+        ),
+        32768: (
+            ("Samsung", "M378A4G43AB2-CWE"), ("Crucial", "CT32G4DFD832A"),
+            ("Kingston", "KVR32N22D8/32"), ("ADATA", "AD4U320032G22-SGN"),
+        ),
     },
 }
 
+
+def _sata_ssd(
+    product: str, model: str, firmware: str, style: str, length: int, pattern: str, oui: str,
+) -> dict[str, Any]:
+    return {
+        "vendor": "ATA", "product": product, "model": model, "firmware": firmware,
+        "serial_style": style, "serial_length": length, "serial_pattern": pattern,
+        "wwn_oui": oui, "interface": "sata", "media_type": "ssd",
+        "rotation_rate": 1, "trim": True,
+    }
+
+
 STORAGE_CATALOG: dict[str, tuple[dict[str, Any], ...]] = {
     "sata": (
-        {"vendor": "ATA", "product": "Samsung SSD 870 EVO", "model": "Samsung SSD 870 EVO", "firmware": "SVT02B6Q", "serial_prefix": "S6P", "serial_length": 15, "wwn_prefix": "5002538", "interface": "sata", "media_type": "ssd", "rotation_rate": 1, "trim": True},
-        {"vendor": "ATA", "product": "Crucial MX500", "model": "Crucial MX500", "firmware": "M3CR046", "serial_prefix": "23", "serial_length": 15, "wwn_prefix": "500a075", "interface": "sata", "media_type": "ssd", "rotation_rate": 1, "trim": True},
-        {"vendor": "ATA", "product": "KINGSTON A400", "model": "KINGSTON SA400S37", "firmware": "SBFK71E0", "serial_prefix": "50026B", "serial_length": 16, "wwn_prefix": "50026b7", "interface": "sata", "media_type": "ssd", "rotation_rate": 1, "trim": True},
-        {"vendor": "ATA", "product": "SanDisk SSD PLUS", "model": "SanDisk SSD PLUS", "firmware": "UH5100RL", "serial_prefix": "2204", "serial_length": 16, "wwn_prefix": "5001b44", "interface": "sata", "media_type": "ssd", "rotation_rate": 1, "trim": True},
+        _sata_ssd("Samsung SSD 870 EVO", "Samsung SSD 870 EVO", "SVT02B6Q", "samsung", 15, r"S[A-Z]{2}[A-Z0-9]{12}", "002538"),
+        _sata_ssd("Samsung SSD 870 QVO", "Samsung SSD 870 QVO", "SVQ02B6Q", "samsung", 15, r"S[A-Z]{2}[A-Z0-9]{12}", "002538"),
+        _sata_ssd("Samsung SSD 860 EVO", "Samsung SSD 860 EVO", "RVT04B6Q", "samsung", 15, r"S[A-Z]{2}[A-Z0-9]{12}", "002538"),
+        _sata_ssd("Crucial MX500", "Crucial MX500", "M3CR046", "crucial", 15, r"[0-9]{2}[A-Z0-9]{13}", "00a075"),
+        _sata_ssd("Crucial BX500", "Crucial BX500", "M6CR056", "crucial", 15, r"[0-9]{2}[A-Z0-9]{13}", "00a075"),
+        _sata_ssd("KINGSTON A400", "KINGSTON SA400S37", "SBFK71E0", "kingston", 16, r"[A-Z0-9]{16}", "0026b7"),
+        _sata_ssd("KINGSTON KC600", "KINGSTON SKC600", "S4500105", "kingston", 16, r"[A-Z0-9]{16}", "0026b7"),
+        _sata_ssd("SanDisk SSD PLUS", "SanDisk SSD PLUS", "UH5100RL", "sandisk", 16, r"[0-9]{4}[A-Z0-9]{12}", "001b44"),
+        _sata_ssd("WD Blue SA510", "WD Blue SA510 2.5", "520041WD", "wd", 16, r"[A-Z0-9]{16}", "0014ee"),
+        _sata_ssd("WD Green SATA", "WDC WDS SATA", "415000WD", "wd", 16, r"[A-Z0-9]{16}", "0014ee"),
+        _sata_ssd("INTEL 545s", "INTEL SSDSC2KW", "LHF002C", "intel", 16, r"[A-Z0-9]{16}", "001de0"),
+        _sata_ssd("ADATA SU800", "ADATA SU800", "Q0125A", "adata", 16, r"[A-Z0-9]{16}", "0022b0"),
+        _sata_ssd("Seagate BarraCuda SSD", "Seagate BarraCuda SSD", "ST40011P", "seagate", 16, r"[A-Z0-9]{16}", "000c50"),
+        _sata_ssd("Transcend SSD230S", "Transcend SSD230S", "R0815B", "transcend", 16, r"[A-Z0-9]{16}", "00d0b0"),
+    ),
+    "nvme": (
+        {"model": "Samsung SSD 980", "firmware": "2B4QFXO7"},
+        {"model": "Samsung SSD 990 EVO", "firmware": "0B2QFXO7"},
+        {"model": "WD_BLACK SN770", "firmware": "731100WD"},
+        {"model": "Crucial P3", "firmware": "P9CR30A"},
+        {"model": "KINGSTON SNV2S", "firmware": "SBM02103"},
+        {"model": "SK hynix PCIe SSD", "firmware": "HPS1A30Q"},
     ),
     "cdrom": (
         {"vendor": "HL-DT-ST", "product": "DVDRAM GUD1N", "model": "HL-DT-ST DVDRAM GUD1N", "firmware": "1.00"},
+        {"vendor": "HL-DT-ST", "product": "DVDRAM GUE1N", "model": "HL-DT-ST DVDRAM GUE1N", "firmware": "1.00"},
+        {"vendor": "HL-DT-ST", "product": "DVDRAM GU90N", "model": "HL-DT-ST DVDRAM GU90N", "firmware": "1.02"},
         {"vendor": "PLDS", "product": "DVD+-RW DU-8A5LH", "model": "PLDS DVD+-RW DU-8A5LH", "firmware": "6D1M"},
+        {"vendor": "PLDS", "product": "DVD+-RW DU-8A5SH", "model": "PLDS DVD+-RW DU-8A5SH", "firmware": "6D1S"},
         {"vendor": "MATSHITA", "product": "DVD-RAM UJ8E2", "model": "MATSHITA DVD-RAM UJ8E2", "firmware": "1.00"},
+        {"vendor": "MATSHITA", "product": "DVD-RAM UJ8G2", "model": "MATSHITA DVD-RAM UJ8G2", "firmware": "1.00"},
+        {"vendor": "TSSTcorp", "product": "CDDVDW SU-208GB", "model": "TSSTcorp CDDVDW SU-208GB", "firmware": "D300"},
+        {"vendor": "TSSTcorp", "product": "CDDVDW SN-208BB", "model": "TSSTcorp CDDVDW SN-208BB", "firmware": "D300"},
+        {"vendor": "ASUS", "product": "SDRW-08U7M-U", "model": "ASUS SDRW-08U7M-U", "firmware": "B101"},
+        {"vendor": "PIONEER", "product": "DVD-RW DVR-XD10", "model": "PIONEER DVD-RW DVR-XD10", "firmware": "1.00"},
+        {"vendor": "ATAPI", "product": "iHAS124   Y", "model": "ATAPI   iHAS124   Y", "firmware": "AL0M"},
     ),
 }
 
@@ -725,14 +867,66 @@ HID_CATALOG = (
         "keyboard_product": "USB Keyboard", "keyboard_vendor_id": "046d", "keyboard_product_id": "c31c",
     },
     {
+        "manufacturer": "Logitech", "mouse_product": "USB Receiver Mouse", "mouse_vendor_id": "046d", "mouse_product_id": "c05a",
+        "keyboard_product": "Keyboard K120", "keyboard_vendor_id": "046d", "keyboard_product_id": "c31c",
+    },
+    {
         "manufacturer": "Dell", "mouse_product": "Dell MS116 USB Optical Mouse", "mouse_vendor_id": "413c", "mouse_product_id": "301a",
         "keyboard_product": "Dell KB216 Wired Keyboard", "keyboard_vendor_id": "413c", "keyboard_product_id": "2113",
+    },
+    {
+        "manufacturer": "Dell", "mouse_product": "Dell MS116t Optical Mouse", "mouse_vendor_id": "413c", "mouse_product_id": "3012",
+        "keyboard_product": "Dell KB212-B Keyboard", "keyboard_vendor_id": "413c", "keyboard_product_id": "2003",
     },
     {
         "manufacturer": "Lenovo", "mouse_product": "Lenovo USB Optical Mouse", "mouse_vendor_id": "17ef", "mouse_product_id": "608d",
         "keyboard_product": "Lenovo Traditional USB Keyboard", "keyboard_vendor_id": "17ef", "keyboard_product_id": "6099",
     },
+    {
+        "manufacturer": "Lenovo", "mouse_product": "Lenovo Optical Mouse", "mouse_vendor_id": "17ef", "mouse_product_id": "6044",
+        "keyboard_product": "Lenovo USB Keyboard", "keyboard_vendor_id": "17ef", "keyboard_product_id": "6047",
+    },
+    {
+        "manufacturer": "Microsoft", "mouse_product": "Microsoft Wheel Mouse Optical", "mouse_vendor_id": "045e", "mouse_product_id": "0040",
+        "keyboard_product": "Microsoft Wired Keyboard 600", "keyboard_vendor_id": "045e", "keyboard_product_id": "0752",
+    },
+    {
+        "manufacturer": "HP", "mouse_product": "HP USB Optical Mouse", "mouse_vendor_id": "03f0", "mouse_product_id": "094a",
+        "keyboard_product": "HP USB Keyboard", "keyboard_vendor_id": "03f0", "keyboard_product_id": "0024",
+    },
+    {
+        "manufacturer": "ASUS", "mouse_product": "ASUS Optical Mouse", "mouse_vendor_id": "0b05", "mouse_product_id": "18f0",
+        "keyboard_product": "ASUS Keyboard", "keyboard_vendor_id": "0b05", "keyboard_product_id": "17c0",
+    },
+    {
+        "manufacturer": "Cherry", "mouse_product": "CHERRY USB Mouse", "mouse_vendor_id": "046a", "mouse_product_id": "b090",
+        "keyboard_product": "CHERRY Wired Keyboard", "keyboard_vendor_id": "046a", "keyboard_product_id": "0001",
+    },
 )
+
+
+def _validate_accessory_catalogs() -> None:
+    for item in STORAGE_CATALOG["sata"]:
+        re.compile(item["serial_pattern"])
+        if not re.fullmatch(r"[0-9a-f]{6}", str(item["wwn_oui"])):
+            raise ValueError(f"SATA 配件 WWN OUI 无效: {item['model']}")
+        if not 12 <= int(item["serial_length"]) <= 20:
+            raise ValueError(f"SATA 配件序列号长度无效: {item['model']}")
+        if len(item["firmware"]) > 8 or len(item["model"]) > 40:
+            raise ValueError(f"SATA 配件 ATA 字符串超长: {item['model']}")
+    for item in STORAGE_CATALOG["cdrom"]:
+        if len(item["vendor"]) > 8 or len(item["product"]) > 16 or len(item["firmware"]) > 8 or len(item["model"]) > 40:
+            raise ValueError(f"光驱配件 ATA 字符串超长: {item['model']}")
+    for item in STORAGE_CATALOG["nvme"]:
+        if len(item["model"]) > 40 or len(item["firmware"]) > 8:
+            raise ValueError(f"NVMe 潜伏型号字符串超长: {item['model']}")
+    for kit in HID_CATALOG:
+        for field in ("mouse_vendor_id", "mouse_product_id", "keyboard_vendor_id", "keyboard_product_id"):
+            if not re.fullmatch(r"[0-9a-f]{4}", kit[field]):
+                raise ValueError(f"HID 配件 PCI/USB ID 无效: {kit['manufacturer']} {field}")
+
+
+_validate_accessory_catalogs()
 
 
 def cache_size_kib(value: str) -> int:
@@ -1441,76 +1635,124 @@ def parse_pcie_link_speed(value: str, field: str) -> str:
     return f"{float(match.group(1)):g}"
 
 
-def host_root_port_identities() -> list[dict[str, Any]]:
-    """Capture every usable root port, preferring PCH ports in stable order."""
-    found: list[tuple[int, Path, dict[str, Any]]] = []
-    for device in sorted(Path("/sys/bus/pci/devices").glob("0000:00:*")):
-        if read_int(device / "class") != 0x060400:
-            continue
-        vendor = read_int(device / "vendor")
-        if vendor not in {0x8086, 0x1022}:
-            continue
-        slot = int(device.name.split(":")[2].split(".")[0], 16)
-        function = int(device.name.rsplit(".", 1)[1], 16)
-        if slot == 0x07:
-            continue
-        if slot in {0x1c, 0x1d}:
-            score = 100 - function
-        elif slot >= 0x1c:
-            score = 50
-        else:
-            score = 10
-        current_width = read_int(device / "current_link_width")
-        record = pci_device_record(device, "root_port", "PCI Express Root Port")
-        record.update({
-            "max_link_speed_gtps": parse_pcie_link_speed(
-                read_privileged_text(device / "max_link_speed") or "", "max_link_speed"
-            ),
-            "max_link_width": read_int(device / "max_link_width"),
-            "current_link_speed_gtps": parse_pcie_link_speed(
-                read_privileged_text(device / "current_link_speed") or "", "current_link_speed"
-            ),
-            "current_link_width": current_width,
+ROOT_PORT_ROLE_ORDER = ("gpu", "nvme", "nic", "usb", "audio", "other", "empty")
+
+
+def pci_class_role(class_code: int) -> str:
+    if (class_code >> 16) & 0xFF == 0x03:
+        return "gpu"
+    if (class_code >> 8) & 0xFFFF == 0x0108:
+        return "nvme"
+    if (class_code >> 16) & 0xFF == 0x02:
+        return "nic"
+    if (class_code >> 8) & 0xFFFF == 0x0c03:
+        return "usb"
+    if (class_code >> 8) & 0xFFFF == 0x0403:
+        return "audio"
+    return "other"
+
+
+def preferred_root_port_role(roles: list[str]) -> str:
+    if not roles:
+        return "empty"
+    return min(roles, key=lambda role: ROOT_PORT_ROLE_ORDER.index(role) if role in ROOT_PORT_ROLE_ORDER else len(ROOT_PORT_ROLE_ORDER))
+
+
+def host_root_port_children(device: Path) -> list[dict[str, str]]:
+    children: list[dict[str, str]] = []
+    for child in sorted(path for path in device.iterdir() if path.is_dir() and path.name.count(":") == 2):
+        children.append({
+            "bdf": child.name,
+            "class_code": f"{read_int(child / 'class'):06x}",
+            "vendor_id": f"{read_int(child / 'vendor'):04x}",
+            "device_id": f"{read_int(child / 'device'):04x}",
         })
-        if record["max_link_width"] <= 0:
-            raise RuntimeError(f"宿主 Root Port {device.name} 链路宽度无效")
-        # Connected ports are preferred for Guest ports with devices.  An
-        # unconnected physical port is still a valid identity/capability
-        # source for a libvirt topology filler with no downstream endpoint.
-        if current_width > 0:
-            score += 1000
-        found.append((-score, device, record))
-    if not found:
-        raise RuntimeError("宿主缺少可用的 PCI Express Root Port 身份")
-    return [record for _, _, record in sorted(found, key=lambda item: (item[0], item[1].name))]
+    return children
 
 
-def guest_root_port_profiles(root: ET.Element, host_ports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def classify_hostdev_role(node: ET.Element) -> str:
+    if node.get("type") != "pci":
+        return "usb" if node.get("type") == "usb" else "other"
+    source = node.find("source/address")
+    if source is None:
+        return "other"
+    try:
+        bdf = (
+            f"{int(source.get('domain', '0'), 0):04x}:"
+            f"{int(source.get('bus', '0'), 0):02x}:"
+            f"{int(source.get('slot', '0'), 0):02x}."
+            f"{int(source.get('function', '0'), 0)}"
+        )
+    except ValueError:
+        return "other"
+    class_code = read_int(Path("/sys/bus/pci/devices") / bdf / "class")
+    if class_code <= 0:
+        return "other"
+    return pci_class_role(class_code)
+
+
+def classify_guest_endpoint(node: ET.Element) -> str | None:
+    if node.tag == "controller":
+        model = node.get("model")
+        kind = node.get("type")
+        if kind == "pci" or model in {"pcie-root", "pcie-root-port", "pcie-to-pci-bridge", "pci-bridge"}:
+            return None
+        if kind == "usb":
+            return "usb"
+        return "other"
+    if node.tag == "interface":
+        return "nic"
+    if node.tag == "video":
+        return "gpu"
+    if node.tag == "sound":
+        return "audio"
+    if node.tag == "hostdev":
+        return classify_hostdev_role(node)
+    if node.tag == "disk":
+        target = node.find("target")
+        bus = (target.get("bus") if target is not None else "") or ""
+        if bus == "nvme" or node.get("type") == "nvme":
+            return "nvme"
+        return "other"
+    address = node.find("address")
+    if address is None or address.get("type") != "pci":
+        return None
+    return "other"
+
+
+def guest_device_bus(node: ET.Element) -> int | None:
+    address = node.find("address")
+    if address is None or address.get("type") != "pci" or not address.get("bus"):
+        return None
+    try:
+        return int(address.get("bus", ""), 0)
+    except ValueError as exc:
+        raise RuntimeError("Guest 设备 PCI bus 地址无效") from exc
+
+
+def list_kept_guest_root_ports(devices: ET.Element | None) -> list[dict[str, Any]]:
+    if devices is None:
+        return []
     used_buses: set[int] = set()
-    devices = root.find("devices")
-    if devices is not None:
-        for node in devices:
-            if node.tag == "controller":
-                continue
-            address = node.find("address")
-            if address is None or address.get("type") != "pci" or not address.get("bus"):
-                continue
-            try:
-                used_buses.add(int(address.get("bus", ""), 0))
-            except ValueError as exc:
-                raise RuntimeError("Guest 设备 PCI bus 地址无效") from exc
+    for node in devices:
+        if node.tag == "controller" and node.get("type") == "pci":
+            continue
+        bus = guest_device_bus(node)
+        if bus is not None:
+            used_buses.add(bus)
     non_root_port_indexes: list[int] = []
-    for controller in root.findall("./devices/controller[@type='pci']"):
-        if controller.get("model") in {"pcie-root", "pcie-root-port"}:
+    for controller in devices.findall("controller"):
+        if controller.get("type") != "pci" or controller.get("model") in {"pcie-root", "pcie-root-port"}:
             continue
         try:
             non_root_port_indexes.append(int(controller.get("index", "0"), 0))
         except ValueError as exc:
             raise RuntimeError("Guest PCI controller index 无效") from exc
     filler_limit = max(non_root_port_indexes, default=0)
-    targets: list[int] = []
-    for controller in root.findall("./devices/controller[@type='pci']"):
-        if controller.get("model") != "pcie-root-port":
+    ports: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for controller in devices.findall("controller"):
+        if controller.get("type") != "pci" or controller.get("model") != "pcie-root-port":
             continue
         try:
             index = int(controller.get("index", "0"), 0)
@@ -1525,19 +1767,147 @@ def guest_root_port_profiles(root: ET.Element, host_ports: list[dict[str, Any]])
             port = int(target.get("port", ""), 0)
         except ValueError as exc:
             raise RuntimeError("Guest PCIe Root Port target port 无效") from exc
-        if port in targets:
+        if port in seen:
             raise RuntimeError(f"Guest PCIe Root Port target port 重复: {port:#x}")
-        targets.append(port)
-    if len(targets) > len(host_ports):
+        seen.add(port)
+        roles = [
+            role
+            for node in devices
+            if guest_device_bus(node) == index
+            for role in (classify_guest_endpoint(node),)
+            if role
+        ]
+        ports.append({"index": index, "port": port, "role": preferred_root_port_role(roles)})
+    return ports
+
+
+def host_root_port_rank(guest_role: str, host: dict[str, Any]) -> tuple[Any, ...]:
+    host_role = str(host.get("host_role") or "other")
+    width = int(host["max_link_width"])
+    bdf = str(host["bdf"])
+    if guest_role == "gpu":
+        if host_role == "gpu":
+            bucket = 0
+        elif width >= 8:
+            bucket = 1
+        elif width >= 4:
+            bucket = 2
+        else:
+            bucket = 9
+        return (bucket, -width, bdf)
+    if guest_role == "nvme":
+        if host_role == "nvme":
+            bucket = 0
+        elif width >= 4:
+            bucket = 1
+        else:
+            bucket = 9
+        return (bucket, abs(width - 4), bdf)
+    if guest_role == "nic":
+        if host_role == "nic":
+            bucket = 0
+        elif host_role == "empty" and width <= 1:
+            bucket = 1
+        elif width <= 4:
+            bucket = 2
+        else:
+            bucket = 3
+        return (bucket, width, bdf)
+    if guest_role == "empty":
+        if host_role == "empty":
+            bucket = 0
+        elif width <= 1:
+            bucket = 1
+        elif width <= 4:
+            bucket = 2
+        else:
+            bucket = 3
+        return (bucket, width, bdf)
+    if host_role == guest_role:
+        bucket = 0
+    elif host_role == "empty":
+        bucket = 1
+    elif width <= 4:
+        bucket = 2
+    else:
+        bucket = 3
+    return (bucket, width, bdf)
+
+
+def assign_root_port_identities(
+    guest_ports: list[dict[str, Any]], host_ports: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if len(guest_ports) > len(host_ports):
         raise RuntimeError(
-            f"Guest 需要 {len(targets)} 个 Root Port，但宿主只有 {len(host_ports)} 个正在工作的可用端口"
+            f"Guest 需要 {len(guest_ports)} 个 Root Port，但宿主只有 {len(host_ports)} 个可用端口"
         )
-    result: list[dict[str, Any]] = []
-    for target, observed in zip(sorted(targets), host_ports):
-        item = deepcopy(observed)
-        item["guest_target_port"] = target
-        result.append(item)
-    return result
+    remaining = list(host_ports)
+    assigned: dict[int, dict[str, Any]] = {}
+    ordered = sorted(
+        guest_ports,
+        key=lambda item: (ROOT_PORT_ROLE_ORDER.index(item["role"]), item["port"]),
+    )
+    for guest in ordered:
+        ranked = sorted(remaining, key=lambda host: host_root_port_rank(guest["role"], host))
+        if not ranked or host_root_port_rank(guest["role"], ranked[0])[0] >= 9:
+            raise RuntimeError(
+                f"宿主没有适合 Guest {guest['role']} Root Port "
+                f"(bus {guest['index']}, port 0x{guest['port']:02x}) 的物理端口"
+            )
+        chosen = ranked[0]
+        remaining = [item for item in remaining if item["bdf"] != chosen["bdf"]]
+        item = deepcopy(chosen)
+        item["guest_target_port"] = guest["port"]
+        item["guest_bus"] = guest["index"]
+        item["guest_role"] = guest["role"]
+        item["mapping_reason"] = (
+            f"guest {guest['role']} bus {guest['index']} port 0x{guest['port']:02x} "
+            f"-> host {chosen['host_role']} {chosen['bdf']} x{chosen['max_link_width']}"
+        )
+        assigned[guest["port"]] = item
+    return [assigned[port] for port in sorted(assigned)]
+
+
+def host_root_port_identities() -> list[dict[str, Any]]:
+    """Capture usable root ports with downstream class, not just slot order."""
+    found: list[dict[str, Any]] = []
+    for device in sorted(Path("/sys/bus/pci/devices").glob("0000:00:*")):
+        if read_int(device / "class") != 0x060400:
+            continue
+        vendor = read_int(device / "vendor")
+        if vendor not in {0x8086, 0x1022}:
+            continue
+        slot = int(device.name.split(":")[2].split(".")[0], 16)
+        if slot == 0x07:
+            continue
+        current_width = read_int(device / "current_link_width")
+        record = pci_device_record(device, "root_port", "PCI Express Root Port")
+        children = host_root_port_children(device)
+        record.update({
+            "max_link_speed_gtps": parse_pcie_link_speed(
+                read_privileged_text(device / "max_link_speed") or "", "max_link_speed"
+            ),
+            "max_link_width": read_int(device / "max_link_width"),
+            "current_link_speed_gtps": parse_pcie_link_speed(
+                read_privileged_text(device / "current_link_speed") or "", "current_link_speed"
+            ),
+            "current_link_width": current_width,
+            "downstream": children,
+            "host_role": preferred_root_port_role(
+                [pci_class_role(int(child["class_code"], 16)) for child in children]
+            ),
+        })
+        if record["max_link_width"] <= 0:
+            raise RuntimeError(f"宿主 Root Port {device.name} 链路宽度无效")
+        found.append(record)
+    if not found:
+        raise RuntimeError("宿主缺少可用的 PCI Express Root Port 身份")
+    return sorted(found, key=lambda item: item["bdf"])
+
+
+def guest_root_port_profiles(root: ET.Element, host_ports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    guest_ports = list_kept_guest_root_ports(root.find("devices"))
+    return assign_root_port_identities(guest_ports, host_ports)
 
 
 def host_vga_identity(display_sub: dict[str, str]) -> dict[str, Any]:
@@ -1587,8 +1957,6 @@ def bind_southbridge_slots(pci_ids: dict[str, dict[str, Any]], xhci: dict[str, A
     occupied: dict[tuple[int, int], str] = {}
     for role in ("lpc", "smbus", "sata", "hda"):
         if role not in pci_ids:
-            if role == "hda":
-                raise RuntimeError("南桥槽位绑定缺少板载 HDA 地址")
             continue
         key = pci_address_key(pci_ids[role]["pci_address"])
         if key in occupied:
@@ -1997,7 +2365,7 @@ def parse_onboard_hda_codec_text(text: str) -> dict[str, Any] | None:
     }
 
 
-def onboard_hda_identity() -> tuple[dict[str, Any], dict[str, Any]]:
+def onboard_hda_identity() -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Bind QEMU HDA to the chipset analog codec only.
 
     USB sound cards and discrete PCIe audio are not identity sources; those
@@ -2033,7 +2401,7 @@ def onboard_hda_identity() -> tuple[dict[str, Any], dict[str, Any]]:
         if matched is not None:
             analog.append((device, matched))
     if not analog:
-        raise RuntimeError("宿主没有板载 Intel/AMD analog HDA。USB 声卡和独立 PCIe 声卡不采集")
+        return None, None
     if len(analog) > 1:
         names = ", ".join(device.name for device, _ in analog)
         raise RuntimeError(f"宿主存在多块板载 analog HDA，无法唯一绑定: {names}")
@@ -2143,51 +2511,234 @@ def host_system_battery() -> dict[str, Any] | None:
     return None
 
 
-def random_alnum(length: int) -> str:
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+DIGITS = "0123456789"
+HEX_DIGITS = "0123456789ABCDEF"
+UPPER_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+ATA_ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+OEM_ALNUM = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+DELL_TAG = "ABCDEFGHJKLMNPRTUVWXYZ0123456789"
+
+
+def tokens(alphabet: str, length: int) -> str:
+    if length < 1:
+        raise ValueError("随机标识长度无效")
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def tokens_between(alphabet: str, minimum: int, maximum: int) -> str:
+    if maximum < minimum:
+        raise ValueError("随机标识长度范围无效")
+    return tokens(alphabet, minimum + secrets.randbelow(maximum - minimum + 1))
+
+
+def take_unique(factory, seen: set[str]) -> str:
+    for _ in range(64):
+        value = factory()
+        key = value.lower()
+        if key not in seen:
+            seen.add(key)
+            return value
+    raise RuntimeError("无法生成不重复的唯一标识")
+
+
+def random_alnum(length: int) -> str:
+    return tokens(OEM_ALNUM, length)
+
+
 def random_hex(length: int) -> str:
-    return "".join(secrets.choice("0123456789ABCDEF") for _ in range(length))
+    return tokens(HEX_DIGITS, length)
 
 
 def storage_serial(identity: dict[str, Any]) -> str:
-    prefix = identity["serial_prefix"]
-    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    length = max(12, int(identity.get("serial_length", "15")))
-    if len(prefix) >= length:
+    style = str(identity["serial_style"])
+    length = int(identity["serial_length"])
+    if style == "samsung":
+        serial = "S" + tokens(UPPER_LETTERS, 2) + tokens(ATA_ALNUM, length - 3)
+    elif style == "crucial":
+        serial = f"{21 + secrets.randbelow(6):02d}" + tokens(ATA_ALNUM, length - 2)
+    elif style == "sandisk":
+        serial = f"{21 + secrets.randbelow(6):02d}{secrets.randbelow(52) + 1:02d}" + tokens(ATA_ALNUM, length - 4)
+    elif style in {"kingston", "wd", "intel", "adata", "seagate", "transcend"}:
+        serial = tokens(ATA_ALNUM, length)
+    else:
+        raise ValueError(f"存储型号 {identity['model']} 缺少序列号结构")
+    pattern = str(identity["serial_pattern"])
+    if len(serial) != length or not re.fullmatch(pattern, serial):
         raise ValueError(f"存储型号 {identity['model']} 的序列号规则无效")
-    return prefix + "".join(secrets.choice(alphabet) for _ in range(length - len(prefix)))
+    return serial
 
 
 def storage_wwn(identity: dict[str, Any]) -> str:
-    prefix = identity["wwn_prefix"].lower()
-    if not re.fullmatch(r"[0-9a-f]{6,15}", prefix):
-        raise ValueError(f"存储型号 {identity['model']} 的 WWN 前缀无效")
-    return (prefix + random_hex(16 - len(prefix))).upper()
+    oui = str(identity["wwn_oui"]).lower()
+    if not re.fullmatch(r"[0-9a-f]{6}", oui):
+        raise ValueError(f"存储型号 {identity['model']} 的 WWN OUI 无效")
+    return ("5" + oui + tokens(HEX_DIGITS, 9)).upper()
+
+
+def dimm_serial(vendor: str) -> str:
+    name = vendor.lower()
+    if "samsung" in name:
+        return tokens(HEX_DIGITS, secrets.choice((8, 12)))
+    if "hynix" in name:
+        return tokens(ATA_ALNUM, secrets.choice((8, 10, 12)))
+    if "micron" in name or "crucial" in name:
+        return f"{21 + secrets.randbelow(6):02d}{secrets.randbelow(52) + 1:02d}{tokens(ATA_ALNUM, 6)}"
+    if "kingston" in name:
+        return tokens(ATA_ALNUM, secrets.choice((10, 12)))
+    if "corsair" in name or "adata" in name:
+        return tokens(ATA_ALNUM, 10)
+    return tokens(ATA_ALNUM, 10)
+
+
+def hid_serial(manufacturer: str) -> str:
+    name = manufacturer.lower()
+    if "logitech" in name:
+        return tokens(DIGITS, secrets.choice((10, 12, 13)))
+    if "microsoft" in name:
+        return tokens(ATA_ALNUM, 12)
+    if "dell" in name:
+        return tokens(OEM_ALNUM, secrets.choice((10, 12)))
+    if "lenovo" in name:
+        return tokens(OEM_ALNUM, secrets.choice((8, 10, 12)))
+    if "hp" in name:
+        return tokens(OEM_ALNUM, secrets.choice((10, 12)))
+    if "asus" in name:
+        return tokens(ATA_ALNUM, 12)
+    if "cherry" in name:
+        return tokens(OEM_ALNUM, secrets.choice((8, 10)))
+    return tokens_between(OEM_ALNUM, 8, 12)
+
+
+def accessory_asset() -> str:
+    return tokens(OEM_ALNUM, secrets.choice((8, 10, 12)))
+
+
+def battery_serial(manufacturer: str) -> str:
+    name = manufacturer.lower()
+    if any(token in name for token in ("lenovo", "smp", "sunwoda", "celxpert", "lg")):
+        return tokens(ATA_ALNUM, secrets.choice((8, 10, 11)))
+    if any(token in name for token in ("dell", "sanyo", "panasonic", "smp")):
+        return tokens(ATA_ALNUM, secrets.choice((7, 11)))
+    return tokens(ATA_ALNUM, secrets.choice((8, 10, 12)))
+
+
+def padded_ascii(value: str, length: int) -> str:
+    cleaned = ascii_clean(value)
+    if len(cleaned) > length:
+        cleaned = cleaned[:length]
+    return cleaned.ljust(length)
+
+
+def firmware_cfg_signature(bios_vendor: str) -> dict[str, str]:
+    vendor = bios_vendor.upper()
+    if "AMI" in vendor or "MEGATREND" in vendor:
+        text = "AMI     "
+    elif "INSYDE" in vendor:
+        text = "INSYDE  "
+    elif "PHOENIX" in vendor:
+        text = "PHOENIX "
+    else:
+        cleaned = re.sub(r"[^A-Z0-9 ]", "", vendor)
+        text = (cleaned + " " * 8)[:8]
+    raw = text.encode("ascii")
+    if len(raw) != 8:
+        raise RuntimeError("fw_cfg 签名长度必须为 8 字节")
+    return {"text": text, "u64": f"0x{int.from_bytes(raw, 'big'):016X}ULL"}
+
+
+def acpi_oem_hid(oem_id: str, suffix: str) -> str:
+    base = re.sub(r"[^A-Z0-9]", "", ascii_clean(oem_id).upper())[:6].ljust(6, "0")
+    extra = re.sub(r"[^A-Z0-9]", "", suffix.upper())[:2].ljust(2, "0")
+    return (base + extra)[:8]
+
+
+def kvm_cpuid_signature(cpu_vendor: str) -> str:
+    if cpu_vendor == "AuthenticAMD":
+        return "AuthenticAMD"
+    if cpu_vendor == "GenuineIntel":
+        return "GenuineIntel"
+    return padded_ascii(cpu_vendor, 12)
+
+
+def latent_qemu_identities(
+    platform: dict[str, Any],
+    hid_kit: dict[str, Any],
+    firmware: dict[str, Any],
+    cpu_vendor: str,
+    seen: set[str],
+) -> dict[str, Any]:
+    nvme = deepcopy(secrets.choice(STORAGE_CATALOG["nvme"]))
+    hid_brand = str(hid_kit["manufacturer"])
+    disk_brand = secrets.choice(("SanDisk", "Kingston", "Samsung", "WD", "Toshiba"))
+    net_brand = secrets.choice(("Realtek", "ASIX", "Aquantia"))
+    signature = firmware_cfg_signature(str(firmware["vendor"]))
+    oem_id = str(firmware["acpi_oem_id"])
+    return {
+        "nvme_model": nvme["model"],
+        "nvme_firmware": nvme["firmware"],
+        "usb_hid_brand": hid_brand,
+        "usb_tablet_product": f"{hid_brand} USB Tablet",
+        "usb_tablet_serial": take_unique(lambda: hid_serial(hid_brand), seen),
+        "usb_hub_brand": ascii_clean(platform["vendor"]).split()[0] or hid_brand,
+        "usb_hub_product": "USB Hub",
+        "usb_hub_serial": take_unique(lambda: tokens(DIGITS, 10), seen),
+        "usb_msd_brand": disk_brand,
+        "usb_msd_product": f"{disk_brand} USB Disk",
+        "usb_msd_serial": take_unique(lambda: tokens(ATA_ALNUM, 16), seen),
+        "usb_mtp_brand": hid_brand,
+        "usb_mtp_product": f"{hid_brand} MTP",
+        "usb_audio_brand": hid_brand,
+        "usb_audio_product": f"{hid_brand} USB Audio",
+        "usb_net_brand": net_brand,
+        "usb_net_product": f"{net_brand} USB NIC",
+        "usb_serial_brand": hid_brand,
+        "usb_serial_product": f"{hid_brand} USB Serial",
+        "usb_braille_product": f"{hid_brand} USB Braille",
+        "usb_ccid_product": f"{hid_brand} USB CCID",
+        "usb_wacom_product": "Wacom PenPartner Tablet",
+        "fw_cfg_signature_text": signature["text"],
+        "fw_cfg_signature_u64": signature["u64"],
+        "fw_cfg_hid": acpi_oem_hid(oem_id, "02"),
+        "pvpanic_hid": acpi_oem_hid(oem_id, "01"),
+        "kvm_signature": kvm_cpuid_signature(cpu_vendor),
+    }
+
+
+def bios_serial(platform: dict[str, Any], system_serial: str) -> str:
+    vendor = platform["vendor"].upper()
+    if "LENOVO" in vendor:
+        return secrets.choice((system_serial, tokens(HEX_DIGITS, 16)))
+    if "DELL" in vendor:
+        return system_serial
+    if "HP" in vendor or "HEWLETT" in vendor:
+        return tokens(OEM_ALNUM, secrets.choice((10, 12)))
+    return tokens(HEX_DIGITS, secrets.choice((8, 12, 16)))
 
 
 def platform_serials(platform: dict[str, Any]) -> dict[str, str]:
     """Generate identifiers in formats commonly used by the selected OEM."""
     vendor = platform["vendor"].upper()
     if "LENOVO" in vendor:
-        system = "PF" + random_alnum(6)
-        board = "L1" + random_alnum(14)
+        system = secrets.choice(("PF", "MP", "YB")) + tokens(OEM_ALNUM, secrets.choice((6, 8)))
+        board = secrets.choice(("L1", "1S")) + tokens(OEM_ALNUM, secrets.choice((12, 14)))
     elif "DELL" in vendor:
-        # Dell Service Tags use seven base-36 characters; board serials use a
-        # manufacturing form rather than a generic UUID.
-        system = random_alnum(7)
-        board = "CN-0" + random_alnum(5) + "-" + random_alnum(5) + "-" + random_alnum(3) + "-" + random_alnum(4)
+        system = tokens(DELL_TAG, 7)
+        board = "CN-0" + tokens(OEM_ALNUM, 5) + "-" + tokens(OEM_ALNUM, 5) + "-" + tokens(OEM_ALNUM, 3) + "-" + tokens(OEM_ALNUM, 4)
+    elif "HP" in vendor or "HEWLETT" in vendor:
+        system = tokens(UPPER_LETTERS, 3) + tokens(DIGITS, 7)
+        board = "PW" + tokens(OEM_ALNUM, secrets.choice((10, 12)))
     elif "ASUS" in vendor:
-        system = random_alnum(15)
-        board = random_alnum(12)
+        system = tokens(OEM_ALNUM, secrets.choice((12, 15)))
+        board = tokens(OEM_ALNUM, secrets.choice((10, 12)))
+    elif "ACER" in vendor:
+        system = "NX" + tokens(OEM_ALNUM, secrets.choice((8, 10)))
+        board = tokens(OEM_ALNUM, 12)
     elif "MSI" in vendor or "MICRO-STAR" in vendor:
-        system = random_alnum(14)
-        board = random_alnum(14)
+        system = tokens(OEM_ALNUM, secrets.choice((12, 14)))
+        board = tokens(OEM_ALNUM, secrets.choice((12, 14)))
     else:
-        system = random_alnum(12)
-        board = random_alnum(16)
+        system = tokens(OEM_ALNUM, secrets.choice((10, 12)))
+        board = tokens(OEM_ALNUM, secrets.choice((12, 16)))
     return {"system": system, "board": board, "chassis": system}
 
 
@@ -2483,12 +3034,17 @@ def validate_storage_profile(record: dict[str, Any]) -> None:
         raise RuntimeError("SATA SSD 缺少型号或固件非唯一信息")
     serial = str(disk.get("serial", ""))
     serial_length = int(identity.get("serial_length", 0))
-    if not 12 <= serial_length <= 20 or len(serial) != serial_length or not re.fullmatch(r"[A-Z0-9]+", serial):
+    pattern = str(identity.get("serial_pattern", ""))
+    if not 12 <= serial_length <= 20 or len(serial) != serial_length or not pattern or not re.fullmatch(pattern, serial):
         raise RuntimeError("SATA SSD 序列号格式与配件规则不一致")
-    if not serial.startswith(str(identity.get("serial_prefix", ""))):
-        raise RuntimeError("SATA SSD 序列号前缀与型号不一致")
     wwn = str(disk.get("wwn", ""))
-    if not re.fullmatch(r"[0-9A-F]{16}", wwn) or not wwn.lower().startswith(str(identity.get("wwn_prefix", "")).lower()):
+    oui = str(identity.get("wwn_oui", "")).lower()
+    if (
+        not re.fullmatch(r"[0-9A-F]{16}", wwn)
+        or not re.fullmatch(r"[0-9a-f]{6}", oui)
+        or wwn[0] != "5"
+        or wwn[1:7].lower() != oui
+    ):
         raise RuntimeError("SATA SSD WWN 格式与型号不一致")
     controller = record.get("hardware", {}).get("storage_controller") or {}
     if controller.get("media_policy") != "sata-ssd-only" or controller.get("ncq") is not True:
@@ -2547,7 +3103,7 @@ def battery_profile(host_battery: dict[str, Any] | None, enabled: bool) -> dict[
         present_rate = secrets.randbelow(22001) + 8000
     if not state:
         present_rate = 0
-    manufacture_year = secrets.choice((2021, 2022, 2023))
+    manufacture_year = 2021 + secrets.randbelow(6)
     manufacture_month = secrets.randbelow(12) + 1
     manufacture_day = secrets.randbelow(28) + 1
     current_temperature = 2732 + (secrets.randbelow(15) + 38) * 10
@@ -2555,7 +3111,7 @@ def battery_profile(host_battery: dict[str, Any] | None, enabled: bool) -> dict[
         "enabled": True,
         "manufacturer": ascii_clean(host_battery["manufacturer"]),
         "model": ascii_clean(host_battery["model"]),
-        "serial": "".join(secrets.choice("0123456789") for _ in range(8)),
+        "serial": battery_serial(ascii_clean(host_battery["manufacturer"])),
         "sbds_serial": secrets.randbelow(0xFFFE) + 1,
         "manufacture_date": f"{manufacture_month:02d}/{manufacture_day:02d}/{manufacture_year}",
         "sbds_manufacture_date": ((manufacture_year - 1980) << 9) | (manufacture_month << 5) | manufacture_day,
@@ -2613,24 +3169,47 @@ def validate_record_coherence(record: dict[str, Any]) -> None:
             raise RuntimeError(f"xHCI 字段没有严格继承受支持的宿主设备: {field}")
     observed_pci = record.get("host", {}).get("pci_identities_profiled", {})
     profiled_pci = record.get("devices", {}).get("pci_identities", {})
-    for name in ("host_bridge", "lpc", "smbus", "sata", "root_port", "vga", "hda"):
+    for name in ("host_bridge", "lpc", "smbus", "sata", "root_port", "vga"):
         if profiled_pci.get(name) != observed_pci.get(name):
             raise RuntimeError(f"{name} PCI identity does not match host observation")
     audio = record["hardware"]["audio"]
-    if audio.get("xml_policy") != "onboard-hda":
-        raise RuntimeError("板载 HDA 必须使用 onboard-hda XML 策略")
-    if audio.get("bdf") != record["host"]["hda_controller_observed"].get("bdf"):
-        raise RuntimeError("HDA PCI 地址没有继承板载控制器")
-    pins = audio.get("codec_pins") or []
-    if not any(pin.get("direction") == "playback" for pin in pins):
-        raise RuntimeError("板载 analog codec 没有可继承的播放针脚")
-    if any(pin.get("source") != "host-observed-onboard-codec" for pin in pins):
-        raise RuntimeError("HDA 针脚必须来自板载 analog codec")
+    audio_policy = audio.get("xml_policy")
+    if record.get("xml_policy", {}).get("audio") != audio_policy:
+        raise RuntimeError("音频 XML 策略前后记录不一致")
+    if audio_policy == "onboard-hda":
+        if profiled_pci.get("hda") != observed_pci.get("hda"):
+            raise RuntimeError("hda PCI identity does not match host observation")
+        observed_hda = record["host"].get("hda_controller_observed") or {}
+        if audio.get("bdf") != observed_hda.get("bdf"):
+            raise RuntimeError("HDA PCI 地址没有继承板载控制器")
+        pins = audio.get("codec_pins") or []
+        if not any(pin.get("direction") == "playback" for pin in pins):
+            raise RuntimeError("板载 analog codec 没有可继承的播放针脚")
+        if any(pin.get("source") != "host-observed-onboard-codec" for pin in pins):
+            raise RuntimeError("HDA 针脚必须来自板载 analog codec")
+    elif audio_policy == "none":
+        if profiled_pci.get("hda") or observed_pci.get("hda"):
+            raise RuntimeError("无板载 analog HDA 时不应写入 HDA PCI 身份")
+    else:
+        raise RuntimeError("音频 XML 策略必须是芯片组 HDA 或 none")
     vga = profiled_pci.get("vga") or {}
     if vga.get("source") != "qemu-stdvga-temporary" or vga.get("vendor_id") != "1234" or vga.get("device_id") != "1111":
         raise RuntimeError("临时 VGA 必须保持 QEMU 1234:1111，不能套用真实 GPU ID")
     if record["hardware"].get("mce_banks") != record["host"].get("mce_banks_observed"):
         raise RuntimeError("MCE bank 数量没有继承宿主")
+    latent = record.get("qemu_policy", {}).get("latent") or {}
+    required_latent = {
+        "nvme_model", "nvme_firmware", "usb_msd_brand", "usb_msd_product", "usb_msd_serial",
+        "usb_hub_brand", "usb_hub_product", "usb_audio_product", "usb_net_product",
+        "fw_cfg_signature_u64", "fw_cfg_hid", "pvpanic_hid", "kvm_signature",
+        "usb_tablet_product", "usb_tablet_serial",
+    }
+    if not required_latent.issubset(latent):
+        raise RuntimeError("身份文件缺少潜伏 QEMU 设备身份")
+    if len(str(latent.get("kvm_signature", ""))) != 12:
+        raise RuntimeError("KVM CPUID 签名必须为 12 字节")
+    if len(str(latent.get("fw_cfg_hid", ""))) != 8 or len(str(latent.get("pvpanic_hid", ""))) != 8:
+        raise RuntimeError("fw_cfg/pvpanic ACPI HID 必须为 8 字符")
     validate_storage_profile(record)
     try:
         hotplug = int(str(record["hardware"].get("cpu_hotplug_io_base", "")), 0)
@@ -2706,18 +3285,19 @@ def build_record(
         raise RuntimeError("宿主缺少当前南桥身份所需的 PCI 主设备: " + ", ".join(missing_primary))
     host_xhci = host_xhci_controller()
     host_audio, host_codec = onboard_hda_identity()
-    host_pci_id["hda"] = {
-        "vendor_id": host_audio["vendor_id"],
-        "device_id": host_audio["device_id"],
-        "revision_id": host_audio["revision_id"],
-        "subsystem_vendor_id": host_audio["subsystem_vendor_id"],
-        "subsystem_device_id": host_audio["subsystem_device_id"],
-        "description": host_audio["product"],
-        "source": "host-observed-onboard",
-        "bdf": host_audio["bdf"],
-        "pci_address": deepcopy(host_audio["pci_address"]),
-        "slot_source": "host-observed",
-    }
+    if host_audio is not None and host_codec is not None:
+        host_pci_id["hda"] = {
+            "vendor_id": host_audio["vendor_id"],
+            "device_id": host_audio["device_id"],
+            "revision_id": host_audio["revision_id"],
+            "subsystem_vendor_id": host_audio["subsystem_vendor_id"],
+            "subsystem_device_id": host_audio["subsystem_device_id"],
+            "description": host_audio["product"],
+            "source": "host-observed-onboard",
+            "bdf": host_audio["bdf"],
+            "pci_address": deepcopy(host_audio["pci_address"]),
+            "slot_source": "host-observed",
+        }
     bind_southbridge_slots(host_pci_id, host_xhci)
     host_acpi = host_acpi_nodes(host_pci_id, host_xhci)
     interrupts = int(host_xhci["interrupts_observed"])
@@ -2738,47 +3318,62 @@ def build_record(
         "interrupt_mode": interrupt_mode,
         "interrupts": interrupts,
     }
-    audio = {
-        "controller_product": host_audio["product"],
-        "controller_vendor_id": host_audio["vendor_id"],
-        "controller_device_id": host_audio["device_id"],
-        "controller_revision_id": host_audio["revision_id"],
-        "controller_subsystem_vendor_id": host_audio["subsystem_vendor_id"],
-        "controller_subsystem_device_id": host_audio["subsystem_device_id"],
-        "codec_name": host_codec["name"],
-        "codec_vendor_device_id": host_codec["vendor_device_id"],
-        "codec_subsystem_id": host_codec["subsystem_id"],
-        "codec_revision_id": host_codec["revision_id"],
-        "codec_cad": host_codec["cad"],
-        "codec_pins": deepcopy(host_codec["pins"]),
-        "libvirt_codec": "duplex" if any(pin["direction"] == "capture" for pin in host_codec["pins"]) else "output",
-        "bdf": host_audio["bdf"],
-        "pci_address": deepcopy(host_audio["pci_address"]),
-        "implementation": "ich9-hda",
-        "xml_policy": "onboard-hda",
-        "patch_if_present": True,
-    }
+    if host_audio is not None and host_codec is not None:
+        audio = {
+            "enabled": True,
+            "controller_product": host_audio["product"],
+            "controller_vendor_id": host_audio["vendor_id"],
+            "controller_device_id": host_audio["device_id"],
+            "controller_revision_id": host_audio["revision_id"],
+            "controller_subsystem_vendor_id": host_audio["subsystem_vendor_id"],
+            "controller_subsystem_device_id": host_audio["subsystem_device_id"],
+            "codec_name": host_codec["name"],
+            "codec_vendor_device_id": host_codec["vendor_device_id"],
+            "codec_subsystem_id": host_codec["subsystem_id"],
+            "codec_revision_id": host_codec["revision_id"],
+            "codec_cad": host_codec["cad"],
+            "codec_pins": deepcopy(host_codec["pins"]),
+            "libvirt_codec": "duplex" if any(pin["direction"] == "capture" for pin in host_codec["pins"]) else "output",
+            "bdf": host_audio["bdf"],
+            "pci_address": deepcopy(host_audio["pci_address"]),
+            "implementation": "ich9-hda",
+            "xml_policy": "onboard-hda",
+            "patch_if_present": True,
+        }
+        host_pci["audio"] = {
+            "vendor_id": host_audio["subsystem_vendor_id"],
+            "device_id": host_audio["subsystem_device_id"],
+            "source": "host-observed-selected-hda",
+        }
+    else:
+        audio = {
+            "enabled": False,
+            "xml_policy": "none",
+            "implementation": "none",
+            "patch_if_present": False,
+        }
     host_pci["usb"] = {
         "vendor_id": host_xhci["subsystem_vendor_id"],
         "device_id": host_xhci["subsystem_device_id"],
         "source": "host-observed-selected-xhci",
     }
-    host_pci["audio"] = {
-        "vendor_id": host_audio["subsystem_vendor_id"],
-        "device_id": host_audio["subsystem_device_id"],
-        "source": "host-observed-selected-hda",
-    }
-    required_pci = {"host_bridge", "root_port", "usb", "lpc", "smbus", "sata", "audio", "display"}
+    required_pci = {"host_bridge", "root_port", "usb", "lpc", "smbus", "sata", "display"}
+    if audio.get("xml_policy") == "onboard-hda":
+        required_pci.add("audio")
     missing_pci = sorted(required_pci - set(host_pci))
     if missing_pci:
         raise RuntimeError("宿主缺少当前 Q35 后端必需的 PCI subsystem 身份: " + ", ".join(missing_pci))
     host_pci_id["vga"] = host_vga_identity(host_pci["display"])
     pci_subsystems = deepcopy(host_pci)
+    optical_identity = deepcopy(secrets.choice(STORAGE_CATALOG["cdrom"]))
+    hid_kit = deepcopy(secrets.choice(HID_CATALOG))
     normalized_storage = []
     for item in storage:
         entry = dict(item)
-        identity_record = storage_identity(item["device"], item["bus"])
-        entry["identity"] = identity_record
+        if item["device"] == "cdrom":
+            entry["identity"] = deepcopy(optical_identity)
+        else:
+            entry["identity"] = storage_identity(item["device"], item["bus"])
         normalized_storage.append(entry)
     generated_uuid = str(uuid.uuid4())
     profile_id = str(uuid.uuid4())
@@ -2787,25 +3382,38 @@ def build_record(
     network_adapters = generate_lan_profiles(mac_addresses, profile_id, prefix)
     for interface, adapter in zip(interfaces, network_adapters):
         interface["managed_network"] = adapter["libvirt_network"]["name"]
+    seen_unique = {
+        value.strip().lower()
+        for value in physical_identifiers.values()
+        if str(value).strip()
+    }
+    for value in (serials["system"], serials["board"], serials["chassis"]):
+        seen_unique.add(value.lower())
     identity = {
         "system_uuid": generated_uuid,
         "system_serial": serials["system"],
         "board_serial": serials["board"],
         "chassis_serial": serials["chassis"],
-        "bios_serial": random_hex(16),
-        "cpu_serial": random_hex(16),
-        "cpu_asset": random_alnum(10),
-        "board_asset": random_alnum(10),
-        "chassis_asset": random_alnum(10),
+        "bios_serial": take_unique(lambda: bios_serial(platform, serials["system"]), seen_unique),
+        "cpu_serial": take_unique(lambda: tokens(HEX_DIGITS, secrets.choice((8, 12, 16))), seen_unique),
+        "cpu_asset": take_unique(accessory_asset, seen_unique),
+        "board_asset": take_unique(accessory_asset, seen_unique),
+        "chassis_asset": take_unique(accessory_asset, seen_unique),
         "chassis_sku": platform["sku"],
-        "dimm_serials": [random_hex(8) for _ in sizes],
-        "dimm_assets": [random_alnum(10) for _ in sizes],
-        "disk_serials": [storage_serial(item["identity"]) for item in normalized_storage if item["device"] != "cdrom"],
-        "disk_wwns": [storage_wwn(item["identity"]) for item in normalized_storage if item["device"] != "cdrom"],
+        "dimm_serials": [take_unique(lambda: dimm_serial(memory_vendor), seen_unique) for _ in sizes],
+        "dimm_assets": [take_unique(accessory_asset, seen_unique) for _ in sizes],
+        "disk_serials": [
+            take_unique(lambda item=item: storage_serial(item["identity"]), seen_unique)
+            for item in normalized_storage if item["device"] != "cdrom"
+        ],
+        "disk_wwns": [
+            take_unique(lambda item=item: storage_wwn(item["identity"]), seen_unique)
+            for item in normalized_storage if item["device"] != "cdrom"
+        ],
         "mac_addresses": mac_addresses,
         "network_adapters": network_adapters,
-        "usb_mouse_serial": "".join(secrets.choice("0123456789") for _ in range(12)),
-        "usb_keyboard_serial": "".join(secrets.choice("0123456789") for _ in range(12)),
+        "usb_mouse_serial": take_unique(lambda: hid_serial(hid_kit["manufacturer"]), seen_unique),
+        "usb_keyboard_serial": take_unique(lambda: hid_serial(hid_kit["manufacturer"]), seen_unique),
         "nvram_id": str(uuid.uuid4()),
     }
     copied = [
@@ -2819,6 +3427,8 @@ def build_record(
     ]
     if copied:
         raise RuntimeError("生成身份意外复制了宿主唯一标识: " + ", ".join(copied))
+    if battery.get("enabled"):
+        battery["serial"] = take_unique(lambda: battery_serial(str(battery.get("manufacturer", ""))), seen_unique)
     fw = firmware_info(platform)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     serial_index = 0
@@ -2896,6 +3506,7 @@ def build_record(
     legacy = configure_guest_profile(legacy)
     smbios = build_smbios_stream(legacy, platform, identity)
     xml_sha = hashlib.sha256(xml_text.encode()).hexdigest()
+    latent = latent_qemu_identities(platform, hid_kit, fw, host["vendor"], seen_unique)
     record: dict[str, Any] = {
         "meta": {
             "schema_version": SCHEMA_VERSION,
@@ -2967,6 +3578,7 @@ def build_record(
                 "media_policy": "sata-ssd-only",
                 "source": "modern-ahci-profile",
             },
+            "optical": deepcopy(optical_identity),
             "cache_kib": cache,
             "firmware": fw,
             "battery": battery,
@@ -3006,10 +3618,13 @@ def build_record(
             "battery_acpi": bool(battery["enabled"]),
             "smbios_entry_point": dict(ENTRY_POINT),
             "usb_hid": {
-                **deepcopy(secrets.choice(HID_CATALOG)),
+                **hid_kit,
                 "mouse_serial": identity["usb_mouse_serial"],
                 "keyboard_serial": identity["usb_keyboard_serial"],
+                "tablet_product": latent["usb_tablet_product"],
+                "tablet_serial": latent["usb_tablet_serial"],
             },
+            "latent": latent,
         },
         "ovmf_policy": {
             "flash_size_bytes": FIRMWARE_SIZE,
@@ -3030,7 +3645,7 @@ def build_record(
             "remove_obvious_virtio_console": True,
             "kvm_hidden": True,
             "vmport": False,
-            "audio": "onboard-hda",
+            "audio": audio["xml_policy"],
         },
         "smbios_profile": legacy,
     }
@@ -3084,12 +3699,17 @@ def main() -> int:
             f"USB2 {usb['usb2_ports']} + USB3 {usb['usb3_ports']})"
         )
         audio = record["hardware"]["audio"]
-        pin_desc = ", ".join(f"{pin['device']}:{pin['config']}" for pin in audio["codec_pins"])
-        print(
-            f"  音频:   {audio['controller_product']} {audio['bdf']} "
-            f"({audio['controller_vendor_id']}:{audio['controller_device_id']}) "
-            f"{audio['codec_name']} [{pin_desc}]"
-        )
+        if audio.get("xml_policy") == "onboard-hda":
+            pin_desc = ", ".join(f"{pin['device']}:{pin['config']}" for pin in audio["codec_pins"])
+            print(
+                f"  音频:   {audio['controller_product']} {audio['bdf']} "
+                f"({audio['controller_vendor_id']}:{audio['controller_device_id']}) "
+                f"{audio['codec_name']} [{pin_desc}]"
+            )
+        else:
+            print("  音频:   无板载 analog HDA（不注入芯片组声卡）")
+        for item in record["devices"]["pci_identities"].get("root_ports") or []:
+            print(f"  RP:     {item.get('mapping_reason')}")
         for index, adapter in enumerate(record["identity"]["network_adapters"], 1):
             print(
                 f"  网络{index}: MAC {adapter['mac']}, "

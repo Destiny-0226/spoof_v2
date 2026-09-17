@@ -21,7 +21,7 @@ OUT = ROOT / "build" / "ovmf"
 EDK2_URL = "https://github.com/tianocore/edk2.git"
 EDK2_REF = "edk2-stable202602"
 PATCH_REVISION = 17
-IDENTITY_SCHEMA_VERSION = 28
+IDENTITY_SCHEMA_VERSION = 32
 ARTIFACT_CONTRACT_VERSION = 1
 SMBIOS_END_MARKER = bytes((127, 4, 0xFF, 0xFE, 0, 0))
 HOST_BGRT_IMAGE = Path("/sys/firmware/acpi/bgrt/image")
@@ -64,7 +64,7 @@ def validate_artifact_contract(profile: dict, smbios: bytes) -> None:
             and smbios.endswith(SMBIOS_END_MARKER)
         )
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("身份文件的 schema 28 产物契约不完整，请重新运行 01") from error
+        raise ValueError(f"身份文件的 schema {IDENTITY_SCHEMA_VERSION} 产物契约不完整，请重新运行 01") from error
     if not valid:
         raise ValueError("identity-hardware.json 或 smbios.bin 已改变，请重新运行 01")
 

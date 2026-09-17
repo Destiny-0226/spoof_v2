@@ -21,8 +21,8 @@ SOURCE = RESOURCES / "qemu11backup"
 OUT = ROOT / "build" / "qemu"
 QEMU_URL = "https://gitlab.com/qemu-project/qemu.git"
 QEMU_REF = "v11.0.2"
-PATCH_REVISION = 37
-IDENTITY_SCHEMA_VERSION = 28
+PATCH_REVISION = 40
+IDENTITY_SCHEMA_VERSION = 32
 ARTIFACT_CONTRACT_VERSION = 1
 SMBIOS_END_MARKER = bytes((127, 4, 0xFF, 0xFE, 0, 0))
 ACPI_NAMESEG_RE = re.compile(r"\A[A-Z_][A-Z0-9_]{3}\Z")
@@ -55,7 +55,7 @@ def validate_artifact_contract(profile: dict, smbios: bytes) -> None:
             and smbios.endswith(SMBIOS_END_MARKER)
         )
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("身份文件的 schema 28 产物契约不完整，请重新运行 01") from error
+        raise ValueError(f"身份文件的 schema {IDENTITY_SCHEMA_VERSION} 产物契约不完整，请重新运行 01") from error
     if not valid:
         raise ValueError("identity-hardware.json 或 smbios.bin 已改变，请重新运行 01")
 
@@ -1329,6 +1329,113 @@ def patch_i226_device(source: Path, profile: dict) -> None:
     meson.write_text(text.replace(marker, addition + marker, 1), encoding="utf-8")
 
 
+def patch_latent_qemu_identities(source: Path, profile: dict) -> None:
+    """Neutralize leftover QEMU product strings even if those devices stay unused."""
+    latent = profile.get("qemu_policy", {}).get("latent") or {}
+    required = {
+        "nvme_model", "nvme_firmware", "usb_hub_brand", "usb_hub_product",
+        "usb_msd_brand", "usb_msd_product", "usb_msd_serial",
+        "usb_mtp_brand", "usb_mtp_product", "usb_audio_brand", "usb_audio_product",
+        "usb_net_brand", "usb_net_product", "usb_serial_brand", "usb_serial_product",
+        "usb_braille_product", "usb_ccid_product", "usb_wacom_product",
+        "fw_cfg_signature_u64", "fw_cfg_hid", "pvpanic_hid", "kvm_signature",
+    }
+    if not required.issubset(latent):
+        raise RuntimeError("身份文件缺少潜伏 QEMU 设备身份，请重新运行 01_generate_identity.py")
+    kvm_signature = str(latent["kvm_signature"])
+    if len(kvm_signature) != 12:
+        raise RuntimeError("KVM CPUID 签名必须为 12 字节")
+    fw_hid = c_string(str(latent["fw_cfg_hid"]))
+    panic_hid = c_string(str(latent["pvpanic_hid"]))
+    if len(fw_hid) != 8 or len(panic_hid) != 8:
+        raise RuntimeError("fw_cfg/pvpanic ACPI HID 必须为 8 字符")
+    nvme_model = c_string(str(latent["nvme_model"])[:40])
+    nvme_firmware = c_string(str(latent["nvme_firmware"])[:8])
+    hub_brand = c_string(str(latent["usb_hub_brand"])[:16])
+    hub_product = c_string(f'{latent["usb_hub_brand"]} {latent["usb_hub_product"]}'[:32])
+    msd_brand = c_string(str(latent["usb_msd_brand"])[:16])
+    msd_product = c_string(str(latent["usb_msd_product"])[:32])
+    msd_serial = c_string(str(latent["usb_msd_serial"])[:16])
+    mtp_brand = c_string(str(latent["usb_mtp_brand"])[:16])
+    mtp_product = c_string(str(latent["usb_mtp_product"])[:32])
+    audio_brand = c_string(str(latent["usb_audio_brand"])[:16])
+    audio_product = c_string(str(latent["usb_audio_product"])[:32])
+    net_brand = c_string(str(latent["usb_net_brand"])[:16])
+    net_product = c_string(str(latent["usb_net_product"])[:40])
+    serial_brand = c_string(str(latent["usb_serial_brand"])[:16])
+    serial_product = c_string(str(latent["usb_serial_product"])[:32])
+    braille_product = c_string(str(latent["usb_braille_product"])[:32])
+    ccid_product = c_string(str(latent["usb_ccid_product"])[:32])
+    wacom_product = c_string(str(latent["usb_wacom_product"])[:32])
+    signature_u64 = str(latent["fw_cfg_signature_u64"])
+    if not re.fullmatch(r"0x[0-9A-Fa-f]{16}ULL", signature_u64):
+        raise RuntimeError("fw_cfg 签名格式无效")
+
+    nvme = source / "hw/nvme/ctrl.c"
+    replace_literal(nvme, 'strpadcpy((char *)id->mn, sizeof(id->mn), "QEMU NVMe Ctrl", \' \');', f'strpadcpy((char *)id->mn, sizeof(id->mn), "{nvme_model}", \' \');', "NVMe identify model")
+    replace_literal(nvme, "strpadcpy((char *)id->fr, sizeof(id->fr), QEMU_VERSION, ' ');", f'strpadcpy((char *)id->fr, sizeof(id->fr), "{nvme_firmware}", \' \');', "NVMe identify firmware")
+
+    replace_literal(source / "hw/nvram/fw_cfg.c", "#define FW_CFG_DMA_SIGNATURE 0x51454d5520434647ULL /* \"QEMU CFG\" */", f"#define FW_CFG_DMA_SIGNATURE {signature_u64} /* firmware cfg */", "fw_cfg DMA signature")
+    replace_literal(source / "include/standard-headers/linux/qemu_fw_cfg.h", "#define FW_CFG_DMA_SIGNATURE    0x51454d5520434647ULL /* \"QEMU CFG\" */", f"#define FW_CFG_DMA_SIGNATURE    {signature_u64} /* firmware cfg */", "fw_cfg header signature")
+    replace_literal(source / "include/standard-headers/linux/qemu_fw_cfg.h", '#define FW_CFG_ACPI_DEVICE_ID	"QEMU0002"', f'#define FW_CFG_ACPI_DEVICE_ID	"{fw_hid}"', "fw_cfg ACPI HID header")
+    replace_literal(source / "pc-bios/optionrom/optionrom.h", "#define FW_CFG_DMA_SIGNATURE 0x51454d5520434647ULL /* \"QEMU CFG\" */", f"#define FW_CFG_DMA_SIGNATURE {signature_u64} /* firmware cfg */", "fw_cfg option ROM signature")
+    replace_literal(source / "hw/i386/fw_cfg.c", 'aml_append(dev, aml_name_decl("_HID", aml_string("QEMU0002")));', f'aml_append(dev, aml_name_decl("_HID", aml_string("{fw_hid}")));', "fw_cfg i386 ACPI HID")
+    replace_literal(source / "hw/nvram/fw_cfg-acpi.c", 'aml_append(dev, aml_name_decl("_HID", aml_string("QEMU0002")));', f'aml_append(dev, aml_name_decl("_HID", aml_string("{fw_hid}")));', "fw_cfg nvram ACPI HID")
+    replace_literal(source / "hw/misc/pvpanic-isa.c", 'aml_append(dev, aml_name_decl("_HID", aml_string("QEMU0001")));', f'aml_append(dev, aml_name_decl("_HID", aml_string("{panic_hid}")));', "pvpanic ACPI HID")
+
+    kvm = source / "target/i386/kvm/kvm.c"
+    replace_literal(kvm, 'memcpy(signature, "KVMKVMKVM\\0\\0\\0", 12);', f'memcpy(signature, "{c_string(kvm_signature)}", 12);', "KVM CPUID signature")
+    replace_literal(kvm, 'memcpy(signature, "Microsoft VS", 12);', 'memcpy(signature, "            ", 12);', "Hyper-V debug CPUID signature")
+    replace_literal(kvm, 'memcpy(signature, "XenVMMXenVMM", 12);', 'memcpy(signature, "            ", 12);', "Xen CPUID signature")
+    kvm_cpu = source / "target/i386/kvm/kvm-cpu.c"
+    for old, new, label in (
+        ('{ "kvmclock", "on" },', '{ "kvmclock", "off" },', "kvmclock default"),
+        ('{ "kvm-nopiodelay", "on" },', '{ "kvm-nopiodelay", "off" },', "kvm-nopiodelay default"),
+        ('{ "kvm-asyncpf", "on" },', '{ "kvm-asyncpf", "off" },', "kvm-asyncpf default"),
+        ('{ "kvm-steal-time", "on" },', '{ "kvm-steal-time", "off" },', "kvm-steal-time default"),
+        ('{ "kvm-pv-eoi", "on" },', '{ "kvm-pv-eoi", "off" },', "kvm-pv-eoi default"),
+        ('{ "kvmclock-stable-bit", "on" },', '{ "kvmclock-stable-bit", "off" },', "kvmclock-stable-bit default"),
+    ):
+        replace_literal(kvm_cpu, old, new, label)
+
+    replace_literal(source / "hw/usb/dev-hub.c", '[STR_MANUFACTURER] = "QEMU",', f'[STR_MANUFACTURER] = "{hub_brand}",', "USB hub manufacturer")
+    replace_literal(source / "hw/usb/dev-hub.c", '[STR_PRODUCT]      = "QEMU USB Hub",', f'[STR_PRODUCT]      = "{hub_product}",', "USB hub product")
+    replace_literal(source / "hw/usb/dev-hub.c", 'uc->product_desc   = "QEMU USB Hub";', f'uc->product_desc   = "{hub_product}";', "USB hub description")
+    replace_literal(source / "hw/usb/dev-storage.c", '[STR_MANUFACTURER] = "QEMU",', f'[STR_MANUFACTURER] = "{msd_brand}",', "USB MSD manufacturer")
+    replace_literal(source / "hw/usb/dev-storage.c", '[STR_PRODUCT]      = "QEMU USB HARDDRIVE",', f'[STR_PRODUCT]      = "{msd_product}",', "USB MSD product")
+    replace_literal(source / "hw/usb/dev-storage.c", '[STR_SERIALNUMBER] = "1",', f'[STR_SERIALNUMBER] = "{msd_serial}",', "USB MSD serial")
+    replace_literal(source / "hw/usb/dev-storage.c", 'uc->product_desc   = "QEMU USB MSD";', f'uc->product_desc   = "{msd_product}";', "USB MSD description")
+    replace_literal(source / "hw/usb/dev-mtp.c", '#define MTP_MANUFACTURER  "QEMU"', f'#define MTP_MANUFACTURER  "{mtp_brand}"', "USB MTP manufacturer")
+    replace_literal(source / "hw/usb/dev-mtp.c", '#define MTP_PRODUCT       "QEMU filesharing"', f'#define MTP_PRODUCT       "{mtp_product}"', "USB MTP product")
+    replace_literal(source / "hw/usb/dev-mtp.c", 'uc->product_desc   = "QEMU USB MTP";', f'uc->product_desc   = "{mtp_product}";', "USB MTP description")
+    replace_literal(source / "hw/usb/dev-audio.c", '[STRING_MANUFACTURER]       = "QEMU",', f'[STRING_MANUFACTURER]       = "{audio_brand}",', "USB audio manufacturer")
+    replace_literal(source / "hw/usb/dev-audio.c", '[STRING_PRODUCT]            = "QEMU USB Audio",', f'[STRING_PRODUCT]            = "{audio_product}",', "USB audio product")
+    replace_literal(source / "hw/usb/dev-audio.c", 'k->product_desc   = "QEMU USB Audio Interface";', f'k->product_desc   = "{audio_product}";', "USB audio description")
+    replace_literal(source / "hw/usb/dev-network.c", '[STRING_MANUFACTURER]       = "QEMU",', f'[STRING_MANUFACTURER]       = "{net_brand}",', "USB net manufacturer")
+    replace_literal(source / "hw/usb/dev-network.c", '[STRING_PRODUCT]            = "RNDIS/QEMU USB Network Device",', f'[STRING_PRODUCT]            = "{net_product}",', "USB net product")
+    replace_literal(source / "hw/usb/dev-network.c", '[STRING_DATA]               = "QEMU USB Net Data Interface",', '[STRING_DATA]               = "USB Net Data Interface",', "USB net data iface")
+    replace_literal(source / "hw/usb/dev-network.c", '[STRING_CONTROL]            = "QEMU USB Net Control Interface",', '[STRING_CONTROL]            = "USB Net Control Interface",', "USB net control iface")
+    replace_literal(source / "hw/usb/dev-network.c", '[STRING_RNDIS_CONTROL]      = "QEMU USB Net RNDIS Control Interface",', '[STRING_RNDIS_CONTROL]      = "USB Net RNDIS Control Interface",', "USB net rndis control")
+    replace_literal(source / "hw/usb/dev-network.c", '[STRING_CDC]                = "QEMU USB Net CDC",', '[STRING_CDC]                = "USB Net CDC",', "USB net CDC")
+    replace_literal(source / "hw/usb/dev-network.c", '[STRING_SUBSET]             = "QEMU USB Net Subset",', '[STRING_SUBSET]             = "USB Net Subset",', "USB net subset")
+    replace_literal(source / "hw/usb/dev-network.c", '[STRING_RNDIS]              = "QEMU USB Net RNDIS",', '[STRING_RNDIS]              = "USB Net RNDIS",', "USB net RNDIS")
+    replace_literal(source / "hw/usb/dev-network.c", 'pstrcpy((char *)outbuf, outlen, "QEMU USB RNDIS Net");', f'pstrcpy((char *)outbuf, outlen, "{net_product}");', "USB net RNDIS pstrcpy")
+    replace_literal(source / "hw/usb/dev-network.c", 'uc->product_desc   = "QEMU USB Network Interface";', f'uc->product_desc   = "{net_product}";', "USB net description")
+    replace_literal(source / "hw/usb/dev-serial.c", '[STR_MANUFACTURER]    = "QEMU",', f'[STR_MANUFACTURER]    = "{serial_brand}",', "USB serial manufacturer")
+    replace_literal(source / "hw/usb/dev-serial.c", '[STR_PRODUCT_SERIAL]  = "QEMU USB SERIAL",', f'[STR_PRODUCT_SERIAL]  = "{serial_product}",', "USB serial product")
+    replace_literal(source / "hw/usb/dev-serial.c", '[STR_PRODUCT_BRAILLE] = "QEMU USB BAUM BRAILLE",', f'[STR_PRODUCT_BRAILLE] = "{braille_product}",', "USB braille product")
+    replace_literal(source / "hw/usb/dev-serial.c", 'uc->product_desc   = "QEMU USB Serial";', f'uc->product_desc   = "{serial_product}";', "USB serial description")
+    replace_literal(source / "hw/usb/dev-serial.c", 'uc->product_desc   = "QEMU USB Braille";', f'uc->product_desc   = "{braille_product}";', "USB braille description")
+    replace_literal(source / "hw/usb/dev-smartcard-reader.c", '#define CCID_PRODUCT_DESCRIPTION        "QEMU USB CCID"', f'#define CCID_PRODUCT_DESCRIPTION        "{ccid_product}"', "USB CCID macro")
+    replace_literal(source / "hw/usb/dev-smartcard-reader.c", '[STR_MANUFACTURER]  = "QEMU",', f'[STR_MANUFACTURER]  = "{serial_brand}",', "USB CCID manufacturer")
+    replace_literal(source / "hw/usb/dev-smartcard-reader.c", '[STR_PRODUCT]       = "QEMU USB CCID",', f'[STR_PRODUCT]       = "{ccid_product}",', "USB CCID product")
+    replace_literal(source / "hw/usb/dev-smartcard-reader.c", 'uc->product_desc   = "QEMU USB CCID";', f'uc->product_desc   = "{ccid_product}";', "USB CCID description")
+    replace_literal(source / "hw/usb/dev-uas.c", '[STR_MANUFACTURER] = "QEMU",', f'[STR_MANUFACTURER] = "{msd_brand}",', "USB UAS manufacturer")
+    replace_literal(source / "hw/usb/dev-wacom.c", '[STR_MANUFACTURER]     = "QEMU",', '[STR_MANUFACTURER]     = "Wacom",', "USB Wacom manufacturer")
+    replace_literal(source / "hw/usb/dev-wacom.c", 'uc->product_desc   = "QEMU PenPartner Tablet";', f'uc->product_desc   = "{wacom_product}";', "USB Wacom description")
+    replace_literal(source / "hw/usb/dev-wacom.c", 'dc->desc = "QEMU PenPartner Tablet";', f'dc->desc = "{wacom_product}";', "USB Wacom device desc")
+
+
 def patch_device_identity(source: Path, profile: dict) -> None:
     storage = profile["storage"]["devices"]
     disk_entry = next((
@@ -1352,9 +1459,11 @@ def patch_device_identity(source: Path, profile: dict) -> None:
         raise RuntimeError("身份文件中的 SATA SSD WWN 无效") from exc
     if disk_wwn <= 0 or disk_wwn > 0xFFFFFFFFFFFFFFFF:
         raise RuntimeError("身份文件中的 SATA SSD WWN 超出 ATA 范围")
-    optical = next((item["identity"] for item in storage if item["device"] == "cdrom"), {
-        "vendor": "HL-DT-ST", "product": "DVDRAM GUD1N", "model": "HL-DT-ST DVDRAM GUD1N", "firmware": "1.00",
-    })
+    optical = next((item["identity"] for item in storage if item["device"] == "cdrom"), None)
+    if optical is None:
+        optical = profile.get("hardware", {}).get("optical")
+    if not isinstance(optical, dict) or not all(str(optical.get(field, "")).strip() for field in ("vendor", "product", "model", "firmware")):
+        raise RuntimeError("身份文件缺少光驱配件身份")
     scsi_disk = next((
         item["identity"] for item in storage
         if item["device"] != "cdrom" and str(item["bus"]).lower() in {"scsi", "sas"}
@@ -1415,9 +1524,12 @@ def patch_device_identity(source: Path, profile: dict) -> None:
     replacements = {
         '[STR_MANUFACTURER]     = "QEMU",': f'[STR_MANUFACTURER]     = "{c_string(policy["manufacturer"])}",',
         '[STR_PRODUCT_MOUSE]    = "QEMU USB Mouse",': f'[STR_PRODUCT_MOUSE]    = "{c_string(policy["mouse_product"])}",',
+        '[STR_PRODUCT_TABLET]   = "QEMU USB Tablet",': f'[STR_PRODUCT_TABLET]   = "{c_string(policy["tablet_product"])}",',
         '[STR_PRODUCT_KEYBOARD] = "QEMU USB Keyboard",': f'[STR_PRODUCT_KEYBOARD] = "{c_string(policy["keyboard_product"])}",',
         '[STR_SERIAL_MOUSE]     = "89126",': f'[STR_SERIAL_MOUSE]     = "{c_string(policy["mouse_serial"])}",',
+        '[STR_SERIAL_TABLET]    = "28754",': f'[STR_SERIAL_TABLET]    = "{c_string(policy["tablet_serial"])}",',
         '[STR_SERIAL_KEYBOARD]  = "68284",': f'[STR_SERIAL_KEYBOARD]  = "{c_string(policy["keyboard_serial"])}",',
+        'uc->product_desc   = "QEMU USB Tablet";': f'uc->product_desc   = "{c_string(policy["tablet_product"])}";',
         'uc->product_desc   = "QEMU USB Mouse";': f'uc->product_desc   = "{c_string(policy["mouse_product"])}";',
         'uc->product_desc   = "QEMU USB Keyboard";': f'uc->product_desc   = "{c_string(policy["keyboard_product"])}";',
     }
@@ -1433,8 +1545,11 @@ def patch_device_identity(source: Path, profile: dict) -> None:
             raise RuntimeError(f"USB HID descriptor marker not found: {descriptor}")
     hid.write_text(hid_text, encoding="utf-8")
     patch_usb_serial_identity(source)
+    patch_latent_qemu_identities(source, profile)
 
     audio = profile["hardware"]["audio"]
+    if audio.get("xml_policy") != "onboard-hda":
+        return
     codec_id = int(audio["codec_vendor_device_id"], 16)
     subsystem_id = int(audio["codec_subsystem_id"], 16)
     revision_id = int(audio["codec_revision_id"], 16)
@@ -1888,21 +2003,22 @@ def patch_pci_subsystem_identity(source: Path, profile: dict) -> None:
         "VGA PCI identity",
     )
 
-    audio_vendor, audio_device = pair("audio")
     audio = profile["hardware"]["audio"]
-    hda = source / "hw/audio/intel-hda.c"
-    hda_marker = "    k->vendor_id = PCI_VENDOR_ID_INTEL;"
-    replace_literal(
-        hda,
-        hda_marker,
-        f"    k->vendor_id = 0x{int(audio['controller_vendor_id'], 16):04x};"
-        + f"\n    k->subsystem_vendor_id = 0x{audio_vendor:04x};"
-        + f"\n    k->subsystem_id = 0x{audio_device:04x};",
-        "HDA controller PCI subsystem",
-    )
-    replace_literal(hda, "    k->device_id = 0x293e;", f"    k->device_id = 0x{int(audio['controller_device_id'], 16):04x};", "HDA controller device ID")
-    replace_literal(hda, "    k->revision = 3;", f"    k->revision = 0x{int(audio['controller_revision_id'], 16):02x};", "HDA controller revision")
-    replace_literal(hda, '    dc->desc = "Intel HD Audio Controller (ich9)";', f'    dc->desc = "{c_string(audio["controller_product"])}";', "HDA controller description")
+    if audio.get("xml_policy") == "onboard-hda":
+        audio_vendor, audio_device = pair("audio")
+        hda = source / "hw/audio/intel-hda.c"
+        hda_marker = "    k->vendor_id = PCI_VENDOR_ID_INTEL;"
+        replace_literal(
+            hda,
+            hda_marker,
+            f"    k->vendor_id = 0x{int(audio['controller_vendor_id'], 16):04x};"
+            + f"\n    k->subsystem_vendor_id = 0x{audio_vendor:04x};"
+            + f"\n    k->subsystem_id = 0x{audio_device:04x};",
+            "HDA controller PCI subsystem",
+        )
+        replace_literal(hda, "    k->device_id = 0x293e;", f"    k->device_id = 0x{int(audio['controller_device_id'], 16):04x};", "HDA controller device ID")
+        replace_literal(hda, "    k->revision = 3;", f"    k->revision = 0x{int(audio['controller_revision_id'], 16):02x};", "HDA controller revision")
+        replace_literal(hda, '    dc->desc = "Intel HD Audio Controller (ich9)";', f'    dc->desc = "{c_string(audio["controller_product"])}";', "HDA controller description")
 
     # Any optional conventional PCI endpoint without a class-specific
     # subsystem identity must inherit the platform OEM, never QEMU's global
@@ -2152,17 +2268,20 @@ def patch_southbridge_devfn(source: Path, profile: dict) -> None:
         (sata_slot, sata_func): "sata",
     }
     hda_item = profile.get("devices", {}).get("pci_identities", {}).get("hda") or {}
-    hda_address = hda_item.get("pci_address") or {}
-    try:
-        hda_slot = int(hda_address["slot"], 0)
-        hda_func = int(hda_address["function"], 0)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError("身份文件缺少板载 HDA PCI 槽位") from exc
-    if (hda_slot, hda_func) in occupied:
-        raise RuntimeError("板载 HDA 与南桥功能槽位冲突")
-    occupied[(hda_slot, hda_func)] = "hda"
-    if len(occupied) != 4:
-        raise RuntimeError("南桥 LPC/SMBus/SATA/HDA 槽位冲突")
+    if profile.get("hardware", {}).get("audio", {}).get("xml_policy") == "onboard-hda":
+        hda_address = hda_item.get("pci_address") or {}
+        try:
+            hda_slot = int(hda_address["slot"], 0)
+            hda_func = int(hda_address["function"], 0)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("身份文件缺少板载 HDA PCI 槽位") from exc
+        if (hda_slot, hda_func) in occupied:
+            raise RuntimeError("板载 HDA 与南桥功能槽位冲突")
+        occupied[(hda_slot, hda_func)] = "hda"
+        if len(occupied) != 4:
+            raise RuntimeError("南桥 LPC/SMBus/SATA/HDA 槽位冲突")
+    elif hda_item:
+        raise RuntimeError("无板载 analog HDA 时不应写入 HDA PCI 身份")
     usb_address = (profile.get("hardware", {}).get("usb_controller") or {}).get("pci_address") or {}
     try:
         usb_slot = int(usb_address["slot"], 0)
@@ -2957,8 +3076,9 @@ def main() -> int:
     profile_southbridge_devfn(profile, "lpc")
     profile_southbridge_devfn(profile, "smbus")
     profile_southbridge_devfn(profile, "sata")
-    if profile.get("hardware", {}).get("audio", {}).get("xml_policy") != "onboard-hda":
-        raise RuntimeError("身份文件未声明板载 HDA 策略")
+    audio_policy = profile.get("hardware", {}).get("audio", {}).get("xml_policy")
+    if audio_policy not in {"onboard-hda", "none"}:
+        raise RuntimeError("身份文件的音频策略必须是芯片组 HDA 或 none")
 
     tools = require_tools(("git", "make", "python3", "ninja", "meson", "pkg-config"))
     compiler = shutil.which("cc") or shutil.which("gcc")
@@ -3090,7 +3210,7 @@ def main() -> int:
         "platform_source_version": profile["meta"]["platform_source_version"],
         "platform_id": profile["meta"]["platform_id"],
         "storage_policy": profile["storage"]["policy"],
-        "patches": ["full-smbios-exclusive", "profile-acpi-identity", "profile-storage-identity", "profile-usb-hid-identity", "usb-serial-without-pci-path", "profile-audio-backend-if-present", "profile-onboard-hda-pins", "profile-pci-subsystem-identity", "profile-host-bridge-did", "profile-southbridge-devfn", "profile-southbridge-acpi-nodes", "profile-mce-banks", "profile-cpu-hotplug-io", "profile-vga-identity", "profile-root-port-identity", f"profile-{usb['capability_profile']}", "qemu-xhci-profile", "xhci-host-port-layout", "xhci-pm-interrupt-capabilities", "xhci-acpi-node", "intel-i226-v-device", "i226-nvm-mac-dsn-coherence", "i226-gpy-mdio-address-zero", "i226-i225-register-contract", "i226-rss-register-contract", "i226-four-descriptor-queues", "i226-2.5gbe-link", "i226-physical-pcie-layout", "i226-migration-state", "hide-fw-cfg-acpi", "clear-fadt-hypervisor-id", "normalize-acpi-topology", "normalize-madt-overrides", "publish-legacy-pit", "normalize-hpet-aml", "normalize-acpi-creator", "omit-acpi-debug-port", "omit-waet", "kvm-only-build", "stripped-runtime", "profile-sata-udma-set-features"],
+        "patches": ["full-smbios-exclusive", "profile-acpi-identity", "profile-storage-identity", "profile-usb-hid-identity", "usb-serial-without-pci-path", "profile-audio-backend-if-present", "profile-onboard-hda-pins", "profile-pci-subsystem-identity", "profile-host-bridge-did", "profile-southbridge-devfn", "profile-southbridge-acpi-nodes", "profile-mce-banks", "profile-cpu-hotplug-io", "profile-vga-identity", "profile-root-port-identity", "latent-nvme-usb-fwcfg-kvm", f"profile-{usb['capability_profile']}", "qemu-xhci-profile", "xhci-host-port-layout", "xhci-pm-interrupt-capabilities", "xhci-acpi-node", "intel-i226-v-device", "i226-nvm-mac-dsn-coherence", "i226-gpy-mdio-address-zero", "i226-i225-register-contract", "i226-rss-register-contract", "i226-four-descriptor-queues", "i226-2.5gbe-link", "i226-physical-pcie-layout", "i226-migration-state", "hide-fw-cfg-acpi", "clear-fadt-hypervisor-id", "normalize-acpi-topology", "normalize-madt-overrides", "publish-legacy-pit", "normalize-hpet-aml", "normalize-acpi-creator", "omit-acpi-debug-port", "omit-waet", "kvm-only-build", "stripped-runtime", "profile-sata-udma-set-features"],
         "tools": tools,
         "binary": "bin/qemu-system-x86_64-ovo",
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),

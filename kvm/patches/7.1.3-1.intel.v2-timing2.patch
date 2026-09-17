@@ -1,0 +1,715 @@
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index 5f2b30d..7b9a35e 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -79,7 +79,7 @@ struct kvm_pic_state {
+ 	__u8 elcr_mask;
+ };
+ 
+-#define KVM_IOAPIC_NUM_PINS  24
++#define KVM_IOAPIC_NUM_PINS  32
+ struct kvm_ioapic_state {
+ 	__u64 base_address;
+ 	__u32 ioregsel;
+diff --git a/arch/x86/kvm/ioapic.h b/arch/x86/kvm/ioapic.h
+index 3dadae0..2cc85f6 100644
+--- a/arch/x86/kvm/ioapic.h
++++ b/arch/x86/kvm/ioapic.h
+@@ -12,7 +12,7 @@ struct kvm;
+ struct kvm_vcpu;
+ 
+ #define IOAPIC_NUM_PINS  KVM_IOAPIC_NUM_PINS
+-#define IOAPIC_VERSION_ID 0x11	/* IOAPIC version */
++#define IOAPIC_VERSION_ID 0x20	/* IOAPIC version */
+ #define IOAPIC_EDGE_TRIG  0
+ #define IOAPIC_LEVEL_TRIG 1
+ 
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 4078e62..0739670 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -54,7 +54,7 @@
+ #endif
+ 
+ /* 14 is the version for Xeon and Pentium 8.4.8*/
+-#define APIC_VERSION			0x14UL
++#define APIC_VERSION			0x15UL
+ #define LAPIC_MMIO_LENGTH		(1 << 12)
+ 
+ /*
+diff --git a/arch/x86/kvm/pmu.c b/arch/x86/kvm/pmu.c
+index e218352..b3589fd 100644
+--- a/arch/x86/kvm/pmu.c
++++ b/arch/x86/kvm/pmu.c
+@@ -11,6 +11,10 @@
+  */
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/cpu.h>
++#include <linux/cpumask.h>
++#include <linux/module.h>
++#include <linux/smp.h>
+ #include <linux/types.h>
+ #include <linux/kvm_host.h>
+ #include <linux/perf_event.h>
+@@ -18,6 +22,8 @@
+ #include <linux/sort.h>
+ #include <asm/perf_event.h>
+ #include <asm/cpu_device_id.h>
++#include <asm/intel-family.h>
++#include <asm/msr.h>
+ #include "x86.h"
+ #include "cpuid.h"
+ #include "lapic.h"
+@@ -29,6 +35,118 @@
+ /* Unadultered PMU capabilities of the host, i.e. of hardware. */
+ static struct x86_pmu_capability __read_mostly kvm_host_pmu;
+ 
++static bool __read_mostly allow_hybrid_pmu = true;
++module_param(allow_hybrid_pmu, bool, 0444);
++MODULE_PARM_DESC(allow_hybrid_pmu,
++		 "Enable the mediated vPMU using uniform Intel P-core capabilities");
++
++struct kvm_hybrid_pmu_sample {
++	u32 core_type;
++	u32 eax;
++	u32 ebx;
++	u32 edx;
++	u64 perf_capabilities;
++};
++
++static void kvm_read_hybrid_pmu_sample(void *data)
++{
++	struct kvm_hybrid_pmu_sample *sample = data;
++	u32 ecx;
++
++	if (cpuid_eax(0) < 0x1a)
++		return;
++
++	sample->core_type = cpuid_eax(0x1a) >> 24;
++	if (sample->core_type != INTEL_CPU_TYPE_CORE)
++		return;
++
++	cpuid_count(0x0a, 0, &sample->eax, &sample->ebx, &ecx, &sample->edx);
++	if (boot_cpu_has(X86_FEATURE_PDCM))
++		rdmsrq(MSR_IA32_PERF_CAPABILITIES, sample->perf_capabilities);
++}
++
++static bool kvm_get_hybrid_pcore_pmu(struct x86_pmu_capability *cap)
++{
++	struct kvm_hybrid_pmu_sample reference = {};
++	struct kvm_hybrid_pmu_sample sample;
++	cpumask_var_t pcore_mask;
++	bool found = false;
++	int cpu, ret;
++
++	if (!zalloc_cpumask_var(&pcore_mask, GFP_KERNEL))
++		return false;
++
++	cpus_read_lock();
++	for_each_online_cpu(cpu) {
++		memset(&sample, 0, sizeof(sample));
++		ret = smp_call_function_single(cpu, kvm_read_hybrid_pmu_sample,
++					       &sample, true);
++		if (ret) {
++			pr_warn("failed to read PMU capability on CPU %d: %d\n",
++				cpu, ret);
++			goto incompatible;
++		}
++
++		if (sample.core_type != INTEL_CPU_TYPE_CORE)
++			continue;
++
++		cpumask_set_cpu(cpu, pcore_mask);
++		if (!found) {
++			reference = sample;
++			found = true;
++			continue;
++		}
++
++		if (sample.eax != reference.eax ||
++		    sample.ebx != reference.ebx ||
++		    sample.edx != reference.edx ||
++		    sample.perf_capabilities != reference.perf_capabilities) {
++			pr_warn("P-core PMU capability differs on CPU %d\n", cpu);
++			goto incompatible;
++		}
++	}
++
++	if (!found || !(reference.eax & 0xff) ||
++	    !((reference.eax >> 8) & 0xff) ||
++	    !((reference.eax >> 16) & 0xff) ||
++	    ((reference.eax >> 16) & 0xff) > 64 ||
++	    ((reference.eax >> 24) & 0xff) > 32 ||
++	    ((reference.edx >> 5) & 0xff) > 64 ||
++	    ((reference.edx & 0x1f) && !((reference.edx >> 5) & 0xff))) {
++		pr_warn("no uniform, valid Intel P-core PMU capability found\n");
++		goto incompatible;
++	}
++
++	cap->version = reference.eax & 0xff;
++	cap->num_counters_gp = (reference.eax >> 8) & 0xff;
++	cap->bit_width_gp = (reference.eax >> 16) & 0xff;
++	cap->events_mask_len = (reference.eax >> 24) & 0xff;
++	cap->events_mask = reference.ebx;
++	cap->num_counters_fixed = reference.edx & 0x1f;
++	cap->bit_width_fixed = (reference.edx >> 5) & 0xff;
++	cap->pebs_ept = 0;
++	cap->mediated = cap->version >= 4 &&
++			  reference.perf_capabilities & PERF_CAP_FW_WRITES;
++
++	pr_info("mediated hybrid vPMU validated P-core CPUs: %*pbl\n",
++		cpumask_pr_args(pcore_mask));
++	pr_info("P-core PMU capability: v%d, %d GP/%d fixed counters, %d-bit\n",
++		cap->version, cap->num_counters_gp,
++		cap->num_counters_fixed, cap->bit_width_gp);
++	if (!cap->mediated)
++		pr_warn("P-core PMU lacks mediated-vPMU prerequisites; using the perf-backed vPMU\n");
++
++	cpus_read_unlock();
++	free_cpumask_var(pcore_mask);
++	return true;
++
++incompatible:
++	cpus_read_unlock();
++	free_cpumask_var(pcore_mask);
++	memset(cap, 0, sizeof(*cap));
++	return false;
++}
++
+ /* KVM's PMU capabilities, i.e. the intersection of KVM and hardware support. */
+ struct x86_pmu_capability __read_mostly kvm_pmu_cap;
+ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_pmu_cap);
+@@ -115,10 +233,18 @@ void kvm_init_pmu_capability(struct kvm_pmu_ops *pmu_ops)
+ 	 * for hybrid PMUs until KVM gains a way to let userspace opt-in.
+ 	 */
+ 	if (cpu_feature_enabled(X86_FEATURE_HYBRID_CPU)) {
+-		enable_pmu = false;
+-		memset(&kvm_host_pmu, 0, sizeof(kvm_host_pmu));
++		if (!enable_pmu || !allow_hybrid_pmu ||
++		    !kvm_get_hybrid_pcore_pmu(&kvm_host_pmu)) {
++			enable_pmu = false;
++			memset(&kvm_host_pmu, 0, sizeof(kvm_host_pmu));
++		} else {
++			/* P-core pinning is an explicit deployment requirement. */
++			enable_mediated_pmu = true;
++		}
+ 	} else {
+ 		perf_get_x86_pmu_capability(&kvm_host_pmu);
++		if (is_intel && enable_pmu)
++			enable_mediated_pmu = true;
+ 	}
+ 
+ 	if (enable_pmu) {
+@@ -138,6 +264,8 @@ void kvm_init_pmu_capability(struct kvm_pmu_ops *pmu_ops)
+ 	if (!enable_pmu || !enable_mediated_pmu || !kvm_host_pmu.mediated ||
+ 	    !pmu_ops->is_mediated_pmu_supported(&kvm_host_pmu))
+ 		enable_mediated_pmu = false;
++	else if (is_intel)
++		pr_info("mediated vPMU enabled automatically\n");
+ 
+ 	if (!enable_mediated_pmu)
+ 		pmu_ops->write_global_ctrl = NULL;
+diff --git a/arch/x86/kvm/vmx/pmu_intel.c b/arch/x86/kvm/vmx/pmu_intel.c
+index 27eb76e..a65fea4 100644
+--- a/arch/x86/kvm/vmx/pmu_intel.c
++++ b/arch/x86/kvm/vmx/pmu_intel.c
+@@ -760,7 +760,10 @@ static bool intel_pmu_is_mediated_pmu_supported(struct x86_pmu_capability *host_
+ {
+ 	u64 host_perf_cap = 0;
+ 
+-	if (boot_cpu_has(X86_FEATURE_PDCM))
++	/* Hybrid capabilities were sampled directly on every online P-core. */
++	if (cpu_feature_enabled(X86_FEATURE_HYBRID_CPU))
++		host_perf_cap = host_pmu->mediated ? PERF_CAP_FW_WRITES : 0;
++	else if (boot_cpu_has(X86_FEATURE_PDCM))
+ 		rdmsrq(MSR_IA32_PERF_CAPABILITIES, host_perf_cap);
+ 
+ 	/*
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -117,6 +117,16 @@
+ static bool __read_mostly fasteoi = 1;
+ module_param(fasteoi, bool, 0444);
+ 
++static bool __read_mostly fast_cpuid = true;
++module_param(fast_cpuid, bool, 0644);
++MODULE_PARM_DESC(fast_cpuid,
++		 "Handle eligible CPUID exits in the standard KVM re-entry loop");
++
++static bool __read_mostly fast_cpuid_direct = true;
++module_param(fast_cpuid_direct, bool, 0644);
++MODULE_PARM_DESC(fast_cpuid_direct,
++		 "Use VMX-local completion for guarded CPUID fastpath exits");
++
+ module_param(enable_apicv, bool, 0444);
+ module_param(enable_ipiv, bool, 0444);
+ 
+@@ -2260,7 +2270,7 @@
+ 
+ u64 vmx_get_supported_debugctl(struct kvm_vcpu *vcpu, bool host_initiated)
+ {
+-	u64 debugctl = 0;
++	u64 debugctl = DEBUGCTLMSR_BTF;
+ 
+ 	if (boot_cpu_has(X86_FEATURE_BUS_LOCK_DETECT) &&
+ 	    (host_initiated || guest_cpu_cap_has(vcpu, X86_FEATURE_BUS_LOCK_DETECT)))
+@@ -6295,6 +6305,15 @@
+ 				     vmx_get_msr_imm_reg(vcpu));
+ }
+ 
++static int handle_vmcall(struct kvm_vcpu *vcpu)
++{
++	/* A hidden hypervisor must behave like bare-metal Intel. */
++	if (!guest_cpu_cap_has(vcpu, X86_FEATURE_HYPERVISOR))
++		return kvm_handle_invalid_op(vcpu);
++
++	return kvm_emulate_hypercall(vcpu);
++}
++
+ /*
+  * The exit handlers return 1 if the exit was handled fully and guest execution
+  * may resume.  Otherwise they set the kvm_run parameter to indicate what needs
+@@ -6316,7 +6335,7 @@
+ 	[EXIT_REASON_INVD]		      = kvm_emulate_invd,
+ 	[EXIT_REASON_INVLPG]		      = handle_invlpg,
+ 	[EXIT_REASON_RDPMC]                   = kvm_emulate_rdpmc,
+-	[EXIT_REASON_VMCALL]                  = kvm_emulate_hypercall,
++	[EXIT_REASON_VMCALL]                  = handle_vmcall,
+ 	[EXIT_REASON_VMCLEAR]		      = handle_vmx_instruction,
+ 	[EXIT_REASON_VMLAUNCH]		      = handle_vmx_instruction,
+ 	[EXIT_REASON_VMPTRLD]		      = handle_vmx_instruction,
+@@ -7434,6 +7453,82 @@
+ 	barrier_nospec();
+ }
+ 
++static int vmx_emulate_cpuid_fast(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	u32 eax = kvm_rax_read(vcpu), ecx = kvm_rcx_read(vcpu);
++	u32 ebx, edx;
++
++	/* Leaf 0 is immutable after KVM_SET_CPUID2 and is a common hot leaf. */
++	if (eax == 0 && likely(vmx->cpuid0_cache.valid)) {
++		eax = vmx->cpuid0_cache.eax;
++		ebx = vmx->cpuid0_cache.ebx;
++		edx = vmx->cpuid0_cache.edx;
++		kvm_trace_cpuid(0, ecx, eax, ebx, vmx->cpuid0_cache.ecx, edx,
++				true, false);
++		ecx = vmx->cpuid0_cache.ecx;
++	} else {
++		/* Keep the live KVM model and all runtime leaf fixups. */
++		kvm_cpuid(vcpu, &eax, &ebx, &ecx, &edx, false);
++	}
++	kvm_rax_write(vcpu, eax);
++	kvm_rbx_write(vcpu, ebx);
++	kvm_rcx_write(vcpu, ecx);
++	kvm_rdx_write(vcpu, edx);
++
++	/*
++	 * The caller excludes TF, userspace debugging, SMM, CPUID faulting,
++	 * and nested guests. Avoid dispatching back through x86.c to VMX,
++	 * but retain VMCS instruction length, RIP wrap, interrupt shadow,
++	 * and the normal PMU instruction-retirement notification.
++	 */
++	if (!vmx_skip_emulated_instruction(vcpu))
++		return 0;
++	kvm_pmu_instruction_retired(vcpu);
++	return 1;
++}
++
++static fastpath_t handle_fastpath_cpuid(struct kvm_vcpu *vcpu)
++{
++	if (!READ_ONCE(fast_cpuid))
++		return EXIT_FASTPATH_NONE;
++
++	/* Keep exceptional exits and instruction accounting on the slow path. */
++	if (vmx_get_exit_reason(vcpu).full != EXIT_REASON_CPUID ||
++	    to_vmx(vcpu)->idt_vectoring_info & VECTORING_INFO_VALID_MASK ||
++	    is_smm(vcpu) || vcpu->guest_debug || cpuid_fault_enabled(vcpu) ||
++	    vcpu->arch.cpuid_dynamic_bits_dirty ||
++	    !kvm_pmu_is_fastpath_emulation_allowed(vcpu))
++		goto slow_path;
++
++	/*
++	 * Guest TF is independent of KVM_GUESTDBG_* controls. Debug registers
++	 * written without exits are synchronized only after the re-entry loop;
++	 * do not synthesize #DB from a stale DR0-DR3/DR7 snapshot here.
++	 */
++	if ((vcpu->arch.switch_db_regs & KVM_DEBUGREG_WONT_EXIT) ||
++	    (kvm_get_rflags(vcpu) & X86_EFLAGS_TF))
++		goto slow_path;
++
++#ifdef CONFIG_KVM_XEN
++	/* Xen clock leaves can access guest memory without an irq-off SRCU lock. */
++	if (vcpu->arch.xen.cpuid.base)
++		goto slow_path;
++#endif
++
++	/* Use KVM's live CPUID model and normal RIP/#DB/interrupt-shadow logic. */
++	if (!(READ_ONCE(fast_cpuid_direct) ? vmx_emulate_cpuid_fast(vcpu) :
++					  kvm_emulate_cpuid(vcpu)))
++		return EXIT_FASTPATH_EXIT_USERSPACE;
++
++	++vcpu->stat.cpuid_fastpath;
++	return EXIT_FASTPATH_REENTER_GUEST;
++
++slow_path:
++	++vcpu->stat.cpuid_fastpath_fallback;
++	return EXIT_FASTPATH_NONE;
++}
++
+ static fastpath_t vmx_exit_handlers_fastpath(struct kvm_vcpu *vcpu,
+ 					     bool force_immediate_exit)
+ {
+@@ -7446,6 +7541,8 @@
+ 		return EXIT_FASTPATH_NONE;
+ 
+ 	switch (vmx_get_exit_reason(vcpu).basic) {
++	case EXIT_REASON_CPUID:
++		return handle_fastpath_cpuid(vcpu);
+ 	case EXIT_REASON_MSR_WRITE:
+ 		return handle_fastpath_wrmsr(vcpu);
+ 	case EXIT_REASON_MSR_WRITE_IMM:
+@@ -7784,6 +7881,8 @@
+ {
+ 	if (!ple_gap)
+ 		kvm_disable_exits(kvm, KVM_X86_DISABLE_EXITS_PAUSE);
++	if (boot_cpu_has(X86_FEATURE_APERFMPERF))
++		kvm_disable_exits(kvm, KVM_X86_DISABLE_EXITS_APERFMPERF);
+ 
+ 	if (boot_cpu_has(X86_BUG_L1TF) && enable_ept) {
+ 		switch (l1tf_mitigation) {
+@@ -7982,6 +8081,18 @@
+ void vmx_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	struct kvm_cpuid_entry2 *entry;
++
++	entry = kvm_find_cpuid_entry(vcpu, 0);
++	if (entry) {
++		vmx->cpuid0_cache.eax = entry->eax;
++		vmx->cpuid0_cache.ebx = entry->ebx;
++		vmx->cpuid0_cache.ecx = entry->ecx;
++		vmx->cpuid0_cache.edx = entry->edx;
++		vmx->cpuid0_cache.valid = true;
++	} else {
++		vmx->cpuid0_cache.valid = false;
++	}
+ 
+ 	/*
+ 	 * XSAVES is effectively enabled if and only if XSAVE is also exposed
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -191,6 +191,37 @@
+ bool __read_mostly enable_mediated_pmu;
+ EXPORT_SYMBOL_FOR_KVM_INTERNAL(enable_mediated_pmu);
+ 
++#define OVO_MSR_WRITE_IGNORE	BIT(0)
++
++struct ovo_synthetic_msr {
++	u32 index;
++	u32 flags;
++	u64 value;
++};
++
++static const struct ovo_synthetic_msr ovo_synthetic_msrs[] = {
++	{ 0x0c80, 0, BIT_ULL(30) }, /* IA32_DEBUG_INTERFACE: locked. */
++	{ 0x0db0, OVO_MSR_WRITE_IGNORE, 0 }, /* IA32_PM_CTL0 */
++	{ 0x0db1, OVO_MSR_WRITE_IGNORE, 0 }, /* IA32_PM_CTL1 */
++	{ 0x0db2, 0, 0 }, /* IA32_THREAD_STALL */
++	{ MSR_IA32_THERM_CONTROL, OVO_MSR_WRITE_IGNORE, 0 },
++	{ MSR_IA32_THERM_INTERRUPT, OVO_MSR_WRITE_IGNORE, 0 },
++	{ MSR_IA32_THERM_STATUS, OVO_MSR_WRITE_IGNORE, 0 },
++	{ MSR_THERM2_CTL, OVO_MSR_WRITE_IGNORE, 0 },
++	{ 0x0982, OVO_MSR_WRITE_IGNORE, 0 }, /* IA32_TME_ACTIVATE */
++};
++
++static const struct ovo_synthetic_msr *ovo_find_synthetic_msr(u32 index)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(ovo_synthetic_msrs); i++)
++		if (ovo_synthetic_msrs[i].index == index)
++			return &ovo_synthetic_msrs[i];
++
++	return NULL;
++}
++
+ bool __read_mostly eager_page_split = true;
+ module_param(eager_page_split, bool, 0644);
+ 
+@@ -307,6 +338,8 @@
+ 	STATS_DESC_COUNTER(VCPU, preemption_other),
+ 	STATS_DESC_IBOOLEAN(VCPU, guest_mode),
+ 	STATS_DESC_COUNTER(VCPU, notify_window_exits),
++	STATS_DESC_COUNTER(VCPU, cpuid_fastpath),
++	STATS_DESC_COUNTER(VCPU, cpuid_fastpath_fallback),
+ };
+ 
+ const struct kvm_stats_header kvm_vcpu_stats_header = {
+@@ -3905,9 +3938,15 @@
+ 
+ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ {
++	const struct ovo_synthetic_msr *synthetic;
+ 	u32 msr = msr_info->index;
+ 	u64 data = msr_info->data;
+ 
++	synthetic = ovo_find_synthetic_msr(msr);
++	if (synthetic)
++		return synthetic->flags & OVO_MSR_WRITE_IGNORE ?
++		       0 : KVM_MSR_RET_UNSUPPORTED;
++
+ 	/*
+ 	 * Do not allow host-initiated writes to trigger the Xen hypercall
+ 	 * page setup; it could incur locking paths which are not expected
+@@ -4356,6 +4395,14 @@
+ 
+ int kvm_get_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ {
++	const struct ovo_synthetic_msr *synthetic;
++
++	synthetic = ovo_find_synthetic_msr(msr_info->index);
++	if (synthetic) {
++		msr_info->data = synthetic->value;
++		return 0;
++	}
++
+ 	switch (msr_info->index) {
+ 	case MSR_IA32_PLATFORM_ID:
+ 	case MSR_IA32_EBL_CR_POWERON:
+@@ -9265,6 +9312,7 @@
+ static int kvm_vcpu_do_singlestep(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_run *kvm_run = vcpu->run;
++	u32 dr6;
+ 
+ 	if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) {
+ 		kvm_run->debug.arch.dr6 = DR6_BS | DR6_ACTIVE_LOW;
+@@ -9273,7 +9321,9 @@
+ 		kvm_run->exit_reason = KVM_EXIT_DEBUG;
+ 		return 0;
+ 	}
+-	kvm_queue_exception_p(vcpu, DB_VECTOR, DR6_BS);
++	dr6 = kvm_vcpu_check_hw_bp(kvm_get_linear_rip(vcpu), DR_RW_EXECUTE,
++				   vcpu->arch.dr7, vcpu->arch.db);
++	kvm_queue_exception_p(vcpu, DB_VECTOR, DR6_BS | dr6);
+ 	return 1;
+ }
+ 
+@@ -10557,7 +10607,8 @@
+ 	 * If the quirk is disabled, synthesize a #UD and let the guest pick up
+ 	 * the pieces.
+ 	 */
+-	if (!kvm_check_has_quirk(vcpu->kvm, KVM_X86_QUIRK_FIX_HYPERCALL_INSN)) {
++	if (!guest_cpu_cap_has(vcpu, X86_FEATURE_HYPERVISOR) ||
++	    !kvm_check_has_quirk(vcpu->kvm, KVM_X86_QUIRK_FIX_HYPERCALL_INSN)) {
+ 		ctxt->exception.error_code_valid = false;
+ 		ctxt->exception.vector = UD_VECTOR;
+ 		ctxt->have_exception = true;
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1728,6 +1728,8 @@
+ 	u64 preemption_other;
+ 	u64 guest_mode;
+ 	u64 notify_window_exits;
++	u64 cpuid_fastpath;
++	u64 cpuid_fastpath_fallback;
+ };
+ 
+ struct x86_instruction_info;
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -84,49 +84,23 @@
+ 	return ret;
+ }
+ 
+-struct kvm_cpuid_entry2 *kvm_find_cpuid_entry2(
++static struct kvm_cpuid_entry2 *__kvm_find_cpuid_entry2(
+ 	struct kvm_cpuid_entry2 *entries, int nent, u32 function, u64 index)
+ {
+ 	struct kvm_cpuid_entry2 *e;
+ 	int i;
+ 
+-	/*
+-	 * KVM has a semi-arbitrary rule that querying the guest's CPUID model
+-	 * with IRQs disabled is disallowed.  The CPUID model can legitimately
+-	 * have over one hundred entries, i.e. the lookup is slow, and IRQs are
+-	 * typically disabled in KVM only when KVM is in a performance critical
+-	 * path, e.g. the core VM-Enter/VM-Exit run loop.  Nothing will break
+-	 * if this rule is violated, this assertion is purely to flag potential
+-	 * performance issues.  If this fires, consider moving the lookup out
+-	 * of the hotpath, e.g. by caching information during CPUID updates.
+-	 */
+-	lockdep_assert_irqs_enabled();
+-
+ 	for (i = 0; i < nent; i++) {
+ 		e = &entries[i];
+ 
+ 		if (e->function != function)
+ 			continue;
+ 
+-		/*
+-		 * If the index isn't significant, use the first entry with a
+-		 * matching function.  It's userspace's responsibility to not
+-		 * provide "duplicate" entries in all cases.
+-		 */
++		/* Preserve first-match semantics, including userspace duplicates. */
+ 		if (!(e->flags & KVM_CPUID_FLAG_SIGNIFCANT_INDEX) || e->index == index)
+ 			return e;
+ 
+-
+-		/*
+-		 * Similarly, use the first matching entry if KVM is doing a
+-		 * lookup (as opposed to emulating CPUID) for a function that's
+-		 * architecturally defined as not having a significant index.
+-		 */
+ 		if (index == KVM_CPUID_INDEX_NOT_SIGNIFICANT) {
+-			/*
+-			 * Direct lookups from KVM should not diverge from what
+-			 * KVM defines internally (the architectural behavior).
+-			 */
+ 			WARN_ON_ONCE(cpuid_function_is_indexed(function));
+ 			return e;
+ 		}
+@@ -134,8 +108,38 @@
+ 
+ 	return NULL;
+ }
++
++struct kvm_cpuid_entry2 *kvm_find_cpuid_entry2(
++	struct kvm_cpuid_entry2 *entries, int nent, u32 function, u64 index)
++{
++	/*
++	 * KVM has a semi-arbitrary rule that querying the guest's CPUID model
++	 * with IRQs disabled is disallowed.  The CPUID model can legitimately
++	 * have over one hundred entries, i.e. the lookup is slow, and IRQs are
++	 * typically disabled in KVM only when KVM is in a performance critical
++	 * path, e.g. the core VM-Enter/VM-Exit run loop.  Nothing will break
++	 * if this rule is violated, this assertion is purely to flag potential
++	 * performance issues.  If this fires, consider moving the lookup out
++	 * of the hotpath, e.g. by caching information during CPUID updates.
++	 */
++	lockdep_assert_irqs_enabled();
++
++	return __kvm_find_cpuid_entry2(entries, nent, function, index);
++}
+ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_find_cpuid_entry2);
+ 
++/*
++ * CPUID emulation deliberately queries the model in the IRQ-off re-entry
++ * loop. The vCPU owns this bounded array and cannot replace it during RUN.
++ * Keep the IRQ-enabled performance assertion for all ordinary KVM lookups.
++ */
++static struct kvm_cpuid_entry2 *kvm_find_cpuid_entry_emulated(
++	struct kvm_vcpu *vcpu, u32 function, u64 index)
++{
++	return __kvm_find_cpuid_entry2(vcpu->arch.cpuid_entries,
++				      vcpu->arch.cpuid_nent, function, index);
++}
++
+ static int kvm_check_cpuid(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_cpuid_entry2 *best;
+@@ -2051,7 +2055,7 @@
+ 	struct kvm_cpuid_entry2 *basic, *class;
+ 	u32 function = *fn_ptr;
+ 
+-	basic = kvm_find_cpuid_entry(vcpu, 0);
++	basic = kvm_find_cpuid_entry_emulated(vcpu, 0, KVM_CPUID_INDEX_NOT_SIGNIFICANT);
+ 	if (!basic)
+ 		return NULL;
+ 
+@@ -2060,11 +2064,14 @@
+ 		return NULL;
+ 
+ 	if (function >= 0x40000000 && function <= 0x4fffffff)
+-		class = kvm_find_cpuid_entry(vcpu, function & 0xffffff00);
++		class = kvm_find_cpuid_entry_emulated(vcpu, function & 0xffffff00,
++						    KVM_CPUID_INDEX_NOT_SIGNIFICANT);
+ 	else if (function >= 0xc0000000)
+-		class = kvm_find_cpuid_entry(vcpu, 0xc0000000);
++		class = kvm_find_cpuid_entry_emulated(vcpu, 0xc0000000,
++						    KVM_CPUID_INDEX_NOT_SIGNIFICANT);
+ 	else
+-		class = kvm_find_cpuid_entry(vcpu, function & 0x80000000);
++		class = kvm_find_cpuid_entry_emulated(vcpu, function & 0x80000000,
++						    KVM_CPUID_INDEX_NOT_SIGNIFICANT);
+ 
+ 	if (class && function <= class->eax)
+ 		return NULL;
+@@ -2082,8 +2089,16 @@
+ 	 * the effective CPUID entry is the max basic leaf.  Note, the index of
+ 	 * the original requested leaf is observed!
+ 	 */
+-	return kvm_find_cpuid_entry_index(vcpu, basic->eax, index);
++	return kvm_find_cpuid_entry_emulated(vcpu, basic->eax, index);
++}
++
++void kvm_trace_cpuid(u32 function, u32 index, u32 eax, u32 ebx,
++		     u32 ecx, u32 edx, bool exact, bool used_max_basic)
++{
++	trace_kvm_cpuid(function, index, eax, ebx, ecx, edx, exact,
++			used_max_basic);
+ }
++EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_trace_cpuid);
+ 
+ bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
+ 	       u32 *ecx, u32 *edx, bool exact_only)
+@@ -2095,7 +2110,7 @@
+ 	if (vcpu->arch.cpuid_dynamic_bits_dirty)
+ 		kvm_update_cpuid_runtime(vcpu);
+ 
+-	entry = kvm_find_cpuid_entry_index(vcpu, function, index);
++	entry = kvm_find_cpuid_entry_emulated(vcpu, function, index);
+ 	exact = !!entry;
+ 
+ 	if (!entry && !exact_only) {
+@@ -2144,14 +2159,14 @@
+ 		 * exists. EDX can be copied from any existing index.
+ 		 */
+ 		if (function == 0xb || function == 0x1f) {
+-			entry = kvm_find_cpuid_entry_index(vcpu, function, 1);
++			entry = kvm_find_cpuid_entry_emulated(vcpu, function, 1);
+ 			if (entry) {
+ 				*ecx = index & 0xff;
+ 				*edx = entry->edx;
+ 			}
+ 		}
+ 	}
+-	trace_kvm_cpuid(orig_function, index, *eax, *ebx, *ecx, *edx, exact,
++	kvm_trace_cpuid(orig_function, index, *eax, *ebx, *ecx, *edx, exact,
+ 			used_max_basic);
+ 	return exact;
+ }
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -205,6 +205,10 @@
+ 
+ 	u32                   idt_vectoring_info;
+ 	ulong                 rflags;
++	struct {
++		u32 eax, ebx, ecx, edx;
++		bool valid;
++	} cpuid0_cache;
+ 
+ 	/*
+ 	 * User return MSRs are always emulated when enabled in the guest, but
+diff --git a/arch/x86/kvm/cpuid.h b/arch/x86/kvm/cpuid.h
+--- a/arch/x86/kvm/cpuid.h
++++ b/arch/x86/kvm/cpuid.h
+@@ -61,6 +61,8 @@
+ 			      struct kvm_cpuid_entry2 __user *entries);
+ bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
+ 	       u32 *ecx, u32 *edx, bool exact_only);
++void kvm_trace_cpuid(u32 function, u32 index, u32 eax, u32 ebx,
++		     u32 ecx, u32 edx, bool exact, bool used_max_basic);
+ 
+ void __init kvm_init_xstate_sizes(void);
+ u32 xstate_required_size(u64 xstate_bv, bool compacted);
