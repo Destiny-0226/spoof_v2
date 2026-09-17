@@ -4,8 +4,8 @@
 The script selects a domain interactively, backs up its current XML, validates
 the two artifacts, and defines the updated XML.  ``--dry-run`` performs the
 same validation and transformation in memory, then prints a unified diff.
-Storage bus/controller information is preserved from the profile rather than
-forced to SATA or NVMe.
+The supported persistent-storage contract is one SATA SSD.  Its model family
+is randomized by step 01 while serial and WWN remain profile-unique.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ BACKUPS = ROOT / "backups"
 QEMU_NS = "http://libvirt.org/schemas/domain/qemu/1.0"
 RUNTIME_ROOT = Path("/opt/ovo-spoof/profiles")
 ET.register_namespace("qemu", QEMU_NS)
-IDENTITY_SCHEMA_VERSION = 27
+IDENTITY_SCHEMA_VERSION = 28
 ARTIFACT_CONTRACT_VERSION = 1
 SMBIOS_END_MARKER = bytes((127, 4, 0xFF, 0xFE, 0, 0))
 GIB = 1024**3
@@ -83,7 +83,7 @@ def validate_artifact_contract(profile: dict, smbios: bytes) -> None:
             and smbios.endswith(SMBIOS_END_MARKER)
         )
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("身份文件的 schema 27 产物契约不完整，请重新运行 01") from error
+        raise ValueError("身份文件的 schema 28 产物契约不完整，请重新运行 01") from error
     if not valid:
         raise ValueError("identity-hardware.json 或 smbios.bin 已改变，请重新运行 01")
 
@@ -415,6 +415,7 @@ def load_artifacts() -> tuple[dict, bytes]:
     validate_usb_identity(profile)
     validate_audio_identity(profile)
     validate_cpu_platform_identity(profile)
+    validate_storage_identity(profile)
     return profile, smbios
 
 
@@ -481,6 +482,34 @@ def validate_cpu_platform_identity(profile: dict) -> None:
         raise ValueError("SMBIOS Type 8 没有继承宿主")
     if smbios.get("slots") != observed.get("slots"):
         raise ValueError("SMBIOS Type 9 没有继承宿主")
+
+
+def validate_storage_identity(profile: dict) -> None:
+    storage = profile.get("storage") or {}
+    disks = [item for item in storage.get("devices", []) if item.get("device") == "disk"]
+    if storage.get("policy") != "single-sata-ssd-v1" or len(disks) != 1:
+        raise ValueError("身份文件必须包含恰好一块 SATA SSD")
+    disk = disks[0]
+    identity = disk.get("identity") or {}
+    if str(disk.get("bus", "")).lower() != "sata" or identity.get("interface") != "sata":
+        raise ValueError("持久磁盘及其身份没有同时声明 SATA")
+    if identity.get("media_type") != "ssd" or identity.get("rotation_rate") != 1 or identity.get("trim") is not True:
+        raise ValueError("SATA SSD 介质能力记录不一致")
+    serial = str(disk.get("serial", ""))
+    try:
+        serial_length = int(identity["serial_length"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("SATA SSD 缺少序列号长度规则") from exc
+    if len(serial) != serial_length or not re.fullmatch(r"[A-Z0-9]{12,20}", serial):
+        raise ValueError("SATA SSD 序列号格式无效")
+    if not serial.startswith(str(identity.get("serial_prefix", ""))):
+        raise ValueError("SATA SSD 序列号与随机配件族不匹配")
+    wwn = str(disk.get("wwn", ""))
+    if not re.fullmatch(r"[0-9A-F]{16}", wwn) or not wwn.lower().startswith(str(identity.get("wwn_prefix", "")).lower()):
+        raise ValueError("SATA SSD WWN 与随机配件族不匹配")
+    controller = profile.get("hardware", {}).get("storage_controller") or {}
+    if controller.get("media_policy") != "sata-ssd-only" or controller.get("ncq") is not True:
+        raise ValueError("AHCI 控制器没有绑定 SATA SSD/NCQ 策略")
 
 
 def validate_audio_identity(profile: dict) -> None:
@@ -625,7 +654,7 @@ def validate_build_outputs(profile: dict) -> None:
     builds = {
         "qemu": {
             "info": BUILD / "qemu" / "build-info.json",
-            "minimum_revision": 35,
+            "minimum_revision": 36,
             "products": ((BUILD / "qemu" / "bin" / "qemu-system-x86_64-ovo", "binary_sha256"),),
         },
         "ovmf": {
@@ -654,6 +683,8 @@ def validate_build_outputs(profile: dict) -> None:
             expected_prefix = str(RUNTIME_ROOT / expected_id / "qemu")
             if info.get("runtime_prefix") != expected_prefix:
                 raise ValueError("QEMU 构建产物仍绑定旧的工作区路径，请重新运行 02_patch_qemu.py")
+            if info.get("storage_policy") != profile["storage"]["policy"]:
+                raise ValueError("QEMU 构建产物没有绑定当前 SATA SSD 策略，请重新运行 02_patch_qemu.py")
         if name == "ovmf" and info.get("secure_boot") is not False:
             raise ValueError("OVMF 构建产物未明确关闭 Secure Boot，请重新运行 03_patch_ovmf.py")
         if name == "ovmf" and info.get("flash_size_bytes") != profile["ovmf_policy"]["flash_size_bytes"]:

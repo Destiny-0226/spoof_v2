@@ -21,8 +21,8 @@ SOURCE = RESOURCES / "qemu11backup"
 OUT = ROOT / "build" / "qemu"
 QEMU_URL = "https://gitlab.com/qemu-project/qemu.git"
 QEMU_REF = "v11.0.2"
-PATCH_REVISION = 35
-IDENTITY_SCHEMA_VERSION = 27
+PATCH_REVISION = 36
+IDENTITY_SCHEMA_VERSION = 28
 ARTIFACT_CONTRACT_VERSION = 1
 SMBIOS_END_MARKER = bytes((127, 4, 0xFF, 0xFE, 0, 0))
 ACPI_NAMESEG_RE = re.compile(r"\A[A-Z_][A-Z0-9_]{3}\Z")
@@ -55,7 +55,7 @@ def validate_artifact_contract(profile: dict, smbios: bytes) -> None:
             and smbios.endswith(SMBIOS_END_MARKER)
         )
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("身份文件的 schema 27 产物契约不完整，请重新运行 01") from error
+        raise ValueError("身份文件的 schema 28 产物契约不完整，请重新运行 01") from error
     if not valid:
         raise ValueError("identity-hardware.json 或 smbios.bin 已改变，请重新运行 01")
 
@@ -1331,9 +1331,27 @@ def patch_i226_device(source: Path, profile: dict) -> None:
 
 def patch_device_identity(source: Path, profile: dict) -> None:
     storage = profile["storage"]["devices"]
-    disk = next((item["identity"] for item in storage if item["device"] != "cdrom"), {
-        "vendor": "ATA", "product": "Samsung SSD 870 EVO", "model": "Samsung SSD 870 EVO", "firmware": "SVT02B6Q",
-    })
+    disk_entry = next((
+        item for item in storage
+        if item["device"] == "disk" and str(item["bus"]).lower() == "sata"
+    ), None)
+    if disk_entry is None:
+        raise RuntimeError("身份文件缺少单块 SATA SSD")
+    disk = disk_entry["identity"]
+    if (
+        profile.get("storage", {}).get("policy") != "single-sata-ssd-v1"
+        or disk.get("interface") != "sata"
+        or disk.get("media_type") != "ssd"
+        or disk.get("rotation_rate") != 1
+        or disk.get("trim") is not True
+    ):
+        raise RuntimeError("身份文件中的 SATA SSD 介质策略无效")
+    try:
+        disk_wwn = int(str(disk_entry["wwn"]), 16)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("身份文件中的 SATA SSD WWN 无效") from exc
+    if disk_wwn <= 0 or disk_wwn > 0xFFFFFFFFFFFFFFFF:
+        raise RuntimeError("身份文件中的 SATA SSD WWN 超出 ATA 范围")
     optical = next((item["identity"] for item in storage if item["device"] == "cdrom"), {
         "vendor": "HL-DT-ST", "product": "DVDRAM GUD1N", "model": "HL-DT-ST DVDRAM GUD1N", "firmware": "1.00",
     })
@@ -1360,6 +1378,20 @@ def patch_device_identity(source: Path, profile: dict) -> None:
         'pstrcpy(s->version, sizeof(s->version), QEMU_HW_VERSION);',
         f'pstrcpy(s->version, sizeof(s->version), kind == IDE_CD ? "{optical_firmware}" : "{disk_firmware}");',
         "IDE firmware revision",
+    )
+    replace_literal(
+        ide,
+        "s->wwn = dev->wwn;",
+        f"s->wwn = dev->wwn ? dev->wwn : (kind == IDE_HD ? UINT64_C(0x{disk_wwn:016x}) : 0);",
+        "IDE disk WWN",
+    )
+
+    ide_device = source / "hw/ide/ide-dev.c"
+    replace_literal(
+        ide_device,
+        'DEFINE_PROP_UINT16("rotation_rate", IDEDrive, dev.rotation_rate, 0),',
+        'DEFINE_PROP_UINT16("rotation_rate", IDEDrive, dev.rotation_rate, 1),',
+        "IDE SSD rotation rate",
     )
 
     atapi = source / "hw/ide/atapi.c"
@@ -3042,6 +3074,7 @@ def main() -> int:
         "platform_source": profile["meta"]["platform_source"],
         "platform_source_version": profile["meta"]["platform_source_version"],
         "platform_id": profile["meta"]["platform_id"],
+        "storage_policy": profile["storage"]["policy"],
         "patches": ["full-smbios-exclusive", "profile-acpi-identity", "profile-storage-identity", "profile-usb-hid-identity", "usb-serial-without-pci-path", "profile-audio-backend-if-present", "profile-onboard-hda-pins", "profile-pci-subsystem-identity", "profile-host-bridge-did", "profile-southbridge-devfn", "profile-southbridge-acpi-nodes", "profile-mce-banks", "profile-cpu-hotplug-io", "profile-vga-identity", "profile-root-port-identity", f"profile-{usb['capability_profile']}", "qemu-xhci-profile", "xhci-host-port-layout", "xhci-pm-interrupt-capabilities", "xhci-acpi-node", "intel-i226-v-device", "i226-nvm-mac-dsn-coherence", "i226-gpy-mdio-address-zero", "i226-i225-register-contract", "i226-rss-register-contract", "i226-four-descriptor-queues", "i226-2.5gbe-link", "i226-physical-pcie-layout", "i226-migration-state", "hide-fw-cfg-acpi", "clear-fadt-hypervisor-id", "normalize-acpi-topology", "normalize-madt-overrides", "publish-legacy-pit", "normalize-hpet-aml", "normalize-acpi-creator", "omit-acpi-debug-port", "omit-waet", "kvm-only-build", "stripped-runtime"],
         "tools": tools,
         "binary": "bin/qemu-system-x86_64-ovo",

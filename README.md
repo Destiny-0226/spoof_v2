@@ -139,14 +139,16 @@ python3 04_apply_spoof.py
    如果后续 PCI controller 要求索引连续，中间的空 Root Port 也会保留，并使用
    宿主未连接但有效的 Root Port 身份；不再由 libvirt 在 define 后暗中补齐；
    显式检测到 PCI 显卡直通时会移除虚拟显卡和 SPICE/VNC 显示设备。
-   持久磁盘的类型、总线和目标仍严格保留 `01` 读取的当前 XML 设置；
-   安装完成后卸载 ISO/CD-ROM 或软盘不会再阻断 `04` 重复应用。
-   磁盘 WWN 只会注入到 libvirt 支持的 IDE/SCSI 设备；`vendor`/`product` 只会
-   注入到 SCSI 设备。SATA、VirtIO 和 NVMe 不写入这些不受支持的 XML 节点，
-   避免定义 XML 时被 libvirt 拒绝。当前 libvirt 无法为多块 IDE/SATA 磁盘逐设备
-   传入 model/firmware，因此 `01` 对这种布局明确失败；多盘应保留一块 SATA，
-   其余使用可逐设备表达身份的 SCSI/NVMe。多块 SCSI/SAS 盘使用同一型号/
-   firmware 模板，但各自有独立 serial/WWN，与 XML 可表达的能力保持一致。
+   当前持久存储契约明确收敛为一块 SATA SSD；`01` 会拒绝其他持久磁盘总线、
+   多系统盘和软盘，不再在 SATA SSD 与机械盘之间随机切换。SSD 型号族与固件等
+   非唯一信息从可信 SATA SSD 配件池随机选择，serial 和 WWN 独立随机并由 profile 锁定。
+   Guest 的 ATA Identify 会同时得到型号、固件、serial、WWN、非旋转介质、TRIM、
+   SATA 代际、ATA major version、UDMA 与 NCQ，避免型号和介质能力互相矛盾。
+   持久磁盘的 SATA 目标和挂载链仍严格保留 `01` 读取的当前 XML 设置；
+   安装完成后卸载 ISO/CD-ROM 不会再阻断 `04` 重复应用。
+   libvirt 的 SATA XML 不接受 WWN、vendor/product 等 SCSI 专用节点；`04` 不写入
+   这些无效节点。由于 profile 只允许一块 SATA SSD，`02` 会把随机 WWN 作为该
+   profile 专属 `ide-hd` 的默认值写进 QEMU，serial 仍由 XML 逐盘注入。
    `VM Generation ID` 会被删除，不再把虚拟化专用 ACPI 设备当作随机身份。
    板载 HDA 只采集 Intel/AMD 芯片组 analog codec：必须在 PCI 总线 0、厂商
    `8086`/`1022`，且不能是独显/核显的 HDMI 功能。USB 声卡和独立 PCIe 声卡
@@ -226,16 +228,16 @@ Host Bridge DID 是单一来源：`01` 写入 `devices.pci_identities.host_bridg
 
 ## 已知边界
 
-### SMBIOS schema 27
+### 身份 schema 28
 
-- `01_generate_identity.py` 是 SMBIOS 的唯一生成和深度校验入口。schema 27 在身份文件中记录身份载荷哈希及 `smbios.bin` 的路径、哈希、大小、入口、Type 127 句柄和 CPU ID 填充策略；`02/03/04` 不再重建 SMBIOS。Type 127 使用 OVMF 最终分配的保留句柄 `0xFEFF`。
+- `01_generate_identity.py` 是身份和 SMBIOS 的唯一生成与深度校验入口。schema 28 在 schema 27 的完整 SMBIOS 契约上新增单 SATA SSD 介质契约；`02/03/04` 不再重建身份。Type 127 使用 OVMF 最终分配的保留句柄 `0xFEFF`。
 - 入口统一为 SMBIOS 3.5，Type 17 长度为 92 字节，声明 DRAM、volatile 工作能力及实装易失容量。额定速度、SPD 编码、Rank、电压缺少虚拟模块证据时保持未知；配置速度是 profile 声明值，不是性能测量。
 - Type 0 ROM 为实际构建约束的 4 MiB；OVMF 强制 `FD_SIZE_4MB` 并检查原始 CODE+VARS 容量。UEFI/虚拟机位据实设置，EC 修订号未知，不再声称未验证的传统 BIOS 功能。
 - 不把宿主汇总缓存直接声明为 Guest 缓存；当前省略 Type 7，Type 4 缓存引用为 FFFF（SMBIOS 2.3+ 的未提供缓存信息）。磁盘模板的 CPU ID 八字节为运行时占位，不是标准“未知”编码；QEMU 在发布给固件前以 Guest CPUID(1).EAX/EDX 填入每个 Type 4，取不到则拒绝启动。CPU 厂商/型号保留 host-passthrough 模板。
 - 磁盘模板校验与 Guest 最终表校验分开。\`validate_guest_stream\` 要求独立采集的 Guest CPUID，只允许这八字节的受控变化；不能拿模板哈希直接要求最终表逐字节相等。Guest 缓存实测尚未接入，明确保持未知。
 - Type 9 保留平台槽位描述，但使用状态和 PCI 地址标记未知；宿主电压/温度/电流探针（26/28/29）不直接发布为 Guest 已实现传感器。捕获的宿主原始资料仍保留在 JSON。
 - XML 的部分启用 vCPU 或逐 CPU 热插拔状态不受固定模型支持，01/04 将拒绝，不悄悄生成全部启用的 CPU 表。
-- 必须明确重新运行 01 并重建 QEMU revision 35、OVMF revision 16 后才能应用。schema 26 及既有构建不会自动升级，也不会因为同步源码而改变现有 VM。
+- 必须明确重新运行 01 并重建 QEMU revision 36、OVMF revision 16 后才能应用。schema 27 及既有构建不会自动升级，也不会因为同步源码而改变现有 VM。
 - 源码/二进制回归不等于 Guest 启动验证。最终还需核对固件入口、Guest 原始 SMBIOS、CPUID、系统内存和 WMI/dmidecode；不能仅凭字段更多就认定合规。
 
 上述编码依据 [DMTF DSP0134](https://www.dmtf.org/sites/default/files/standards/documents/DSP0134_3.8.0.pdf)；4 MiB 构建选项来自 [EDK2 OVMF](https://github.com/tianocore/edk2/blob/edk2-stable202602/OvmfPkg/OvmfPkgX64.dsc)。

@@ -34,7 +34,7 @@ from xml.etree import ElementTree as ET
 
 MIB = 1024**2
 GIB = 1024**3
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 MEMORY_LAYOUT = "q35-fixed-sequential-v1"
 ARTIFACT_CONTRACT_VERSION = 1
 
@@ -260,7 +260,7 @@ def validate_stream(data: bytes, profile: dict, platform: dict, identity: dict) 
 def validate_memory_record(record: dict, data: bytes | None = None) -> None:
     try:
         if record["meta"]["schema_version"] != SCHEMA_VERSION:
-            raise ValueError("身份文件需要 schema 27，请重新运行 01 并重建 02/03")
+            raise ValueError("身份文件需要 schema 28，请重新运行 01 并重建 02/03")
         profile = record["smbios_profile"]
         memory = record["hardware"]["memory"]
         host_memory = record["host"]["smbios_non_unique"]["memory"]
@@ -705,22 +705,12 @@ MEMORY_CATALOG: dict[tuple[str, str], dict[int, tuple[tuple[str, str], ...]]] = 
     },
 }
 
-STORAGE_CATALOG: dict[str, tuple[dict[str, str], ...]] = {
+STORAGE_CATALOG: dict[str, tuple[dict[str, Any], ...]] = {
     "sata": (
-        {"vendor": "ATA", "product": "Samsung SSD 870 EVO", "model": "Samsung SSD 870 EVO", "firmware": "SVT02B6Q", "serial_prefix": "S6P", "wwn_prefix": "5002538"},
-        {"vendor": "ATA", "product": "Crucial MX500", "model": "CT1000MX500SSD1", "firmware": "M3CR046", "serial_prefix": "23", "wwn_prefix": "500a075"},
-        {"vendor": "ATA", "product": "WDC WD10EZEX", "model": "WDC WD10EZEX-08WN4A0", "firmware": "01.01A01", "serial_prefix": "WD-WCC6", "wwn_prefix": "50014ee"},
-        {"vendor": "ATA", "product": "KINGSTON SA400S37", "model": "KINGSTON SA400S37", "firmware": "SBFK71E0", "serial_prefix": "50026B", "wwn_prefix": "50026b7"},
-    ),
-    "nvme": (
-        {"vendor": "SAMSUNG", "product": "SSD 980 PRO", "model": "Samsung SSD 980 PRO", "firmware": "5B2QGXA7", "serial_prefix": "S5GX", "wwn_prefix": "002538"},
-        {"vendor": "SK hynix", "product": "PC801 NVMe", "model": "SK hynix PC801", "firmware": "51003141", "serial_prefix": "AJA", "wwn_prefix": "000000"},
-        {"vendor": "WD", "product": "WD_BLACK SN850X", "model": "WD_BLACK SN850X", "firmware": "620331WD", "serial_prefix": "222", "wwn_prefix": "001b44"},
-        {"vendor": "Crucial", "product": "CT1000P5PSSD8", "model": "CT1000P5PSSD8", "firmware": "P7CR403", "serial_prefix": "224", "wwn_prefix": "00a075"},
-    ),
-    "scsi": (
-        {"vendor": "SAMSUNG", "product": "MZ7L3480HCHQ", "model": "MZ7L3480HCHQ", "firmware": "GDC5", "serial_prefix": "S4G7", "wwn_prefix": "5002538"},
-        {"vendor": "SEAGATE", "product": "ST1200MM0129", "model": "ST1200MM0129", "firmware": "C005", "serial_prefix": "WFK", "wwn_prefix": "5000c50"},
+        {"vendor": "ATA", "product": "Samsung SSD 870 EVO", "model": "Samsung SSD 870 EVO", "firmware": "SVT02B6Q", "serial_prefix": "S6P", "serial_length": 15, "wwn_prefix": "5002538", "interface": "sata", "media_type": "ssd", "rotation_rate": 1, "trim": True},
+        {"vendor": "ATA", "product": "Crucial MX500", "model": "Crucial MX500", "firmware": "M3CR046", "serial_prefix": "23", "serial_length": 15, "wwn_prefix": "500a075", "interface": "sata", "media_type": "ssd", "rotation_rate": 1, "trim": True},
+        {"vendor": "ATA", "product": "KINGSTON A400", "model": "KINGSTON SA400S37", "firmware": "SBFK71E0", "serial_prefix": "50026B", "serial_length": 16, "wwn_prefix": "50026b7", "interface": "sata", "media_type": "ssd", "rotation_rate": 1, "trim": True},
+        {"vendor": "ATA", "product": "SanDisk SSD PLUS", "model": "SanDisk SSD PLUS", "firmware": "UH5100RL", "serial_prefix": "2204", "serial_length": 16, "wwn_prefix": "5001b44", "interface": "sata", "media_type": "ssd", "rotation_rate": 1, "trim": True},
     ),
     "cdrom": (
         {"vendor": "HL-DT-ST", "product": "DVDRAM GUD1N", "model": "HL-DT-ST DVDRAM GUD1N", "firmware": "1.00"},
@@ -2162,7 +2152,7 @@ def random_hex(length: int) -> str:
     return "".join(secrets.choice("0123456789ABCDEF") for _ in range(length))
 
 
-def storage_serial(identity: dict[str, str]) -> str:
+def storage_serial(identity: dict[str, Any]) -> str:
     prefix = identity["serial_prefix"]
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     length = max(12, int(identity.get("serial_length", "15")))
@@ -2171,7 +2161,7 @@ def storage_serial(identity: dict[str, str]) -> str:
     return prefix + "".join(secrets.choice(alphabet) for _ in range(length - len(prefix)))
 
 
-def storage_wwn(identity: dict[str, str]) -> str:
+def storage_wwn(identity: dict[str, Any]) -> str:
     prefix = identity["wwn_prefix"].lower()
     if not re.fullmatch(r"[0-9a-f]{6,15}", prefix):
         raise ValueError(f"存储型号 {identity['model']} 的 WWN 前缀无效")
@@ -2459,11 +2449,50 @@ def memory_identity(memory_type: str, platform_class: str, sizes_mib: list[int])
     return vendor, parts
 
 
-def storage_identity(device: str, bus: str) -> dict[str, str]:
-    key = "cdrom" if device == "cdrom" else ({"ide": "sata", "sata": "sata", "scsi": "scsi", "sas": "scsi", "nvme": "nvme"}.get(bus.lower()))
+def storage_identity(device: str, bus: str) -> dict[str, Any]:
+    if device != "cdrom" and bus.lower() != "sata":
+        raise RuntimeError(f"持久磁盘必须使用 SATA 总线，当前为 {bus!r}")
+    key = "cdrom" if device == "cdrom" else "sata"
     if key is None or key not in STORAGE_CATALOG:
-        raise RuntimeError(f"没有可安全隐藏的 {bus!r} 存储设备目录；请使用 SATA、SCSI/SAS 或 NVMe")
+        raise RuntimeError(f"没有可安全使用的 {bus!r} 存储设备目录")
     return deepcopy(secrets.choice(STORAGE_CATALOG[key]))
+
+
+def validate_storage_layout(storage: list[dict[str, Any]]) -> None:
+    disks = [item for item in storage if item["device"] == "disk"]
+    if len(disks) != 1:
+        raise RuntimeError("当前身份模型要求恰好一块持久 SATA SSD")
+    if str(disks[0].get("bus", "")).lower() != "sata":
+        raise RuntimeError("持久磁盘必须使用 SATA 总线")
+    if any(item["device"] == "floppy" for item in storage):
+        raise RuntimeError("当前身份模型不支持软盘设备")
+
+
+def validate_storage_profile(record: dict[str, Any]) -> None:
+    devices = record.get("storage", {}).get("devices") or []
+    disks = [item for item in devices if item.get("device") == "disk"]
+    if record.get("storage", {}).get("policy") != "single-sata-ssd-v1" or len(disks) != 1:
+        raise RuntimeError("存储身份必须使用 single-sata-ssd-v1 策略")
+    disk = disks[0]
+    identity = disk.get("identity") or {}
+    if str(disk.get("bus", "")).lower() != "sata" or identity.get("interface") != "sata":
+        raise RuntimeError("持久磁盘及其身份必须同时声明 SATA")
+    if identity.get("media_type") != "ssd" or identity.get("rotation_rate") != 1 or identity.get("trim") is not True:
+        raise RuntimeError("SATA 磁盘身份必须声明非旋转 SSD 与 TRIM")
+    if not all(str(identity.get(field, "")).strip() for field in ("product", "model", "firmware")):
+        raise RuntimeError("SATA SSD 缺少型号或固件非唯一信息")
+    serial = str(disk.get("serial", ""))
+    serial_length = int(identity.get("serial_length", 0))
+    if not 12 <= serial_length <= 20 or len(serial) != serial_length or not re.fullmatch(r"[A-Z0-9]+", serial):
+        raise RuntimeError("SATA SSD 序列号格式与配件规则不一致")
+    if not serial.startswith(str(identity.get("serial_prefix", ""))):
+        raise RuntimeError("SATA SSD 序列号前缀与型号不一致")
+    wwn = str(disk.get("wwn", ""))
+    if not re.fullmatch(r"[0-9A-F]{16}", wwn) or not wwn.lower().startswith(str(identity.get("wwn_prefix", "")).lower()):
+        raise RuntimeError("SATA SSD WWN 格式与型号不一致")
+    controller = record.get("hardware", {}).get("storage_controller") or {}
+    if controller.get("media_policy") != "sata-ssd-only" or controller.get("ncq") is not True:
+        raise RuntimeError("AHCI 控制器没有绑定 SATA SSD/NCQ 策略")
 
 
 def firmware_info(platform: dict[str, Any]) -> dict[str, Any]:
@@ -2602,6 +2631,7 @@ def validate_record_coherence(record: dict[str, Any]) -> None:
         raise RuntimeError("临时 VGA 必须保持 QEMU 1234:1111，不能套用真实 GPU ID")
     if record["hardware"].get("mce_banks") != record["host"].get("mce_banks_observed"):
         raise RuntimeError("MCE bank 数量没有继承宿主")
+    validate_storage_profile(record)
     try:
         hotplug = int(str(record["hardware"].get("cpu_hotplug_io_base", "")), 0)
     except (TypeError, ValueError) as exc:
@@ -2659,6 +2689,7 @@ def build_record(
     memory_vendor, dimm_parts = memory_identity(platform["memory_type"], platform["class"], sizes)
     cache = host_cache_sizes()
     storage = parse_storage(root)
+    validate_storage_layout(storage)
     interfaces = parse_interfaces(root)
     hostdevs = parse_hostdevs(root)
     host_pci = host_pci_subsystems()
@@ -2744,26 +2775,11 @@ def build_record(
     host_pci_id["vga"] = host_vga_identity(host_pci["display"])
     pci_subsystems = deepcopy(host_pci)
     normalized_storage = []
-    shared_scsi_identity: dict[str, str] | None = None
     for item in storage:
         entry = dict(item)
         identity_record = storage_identity(item["device"], item["bus"])
-        if item["device"] != "cdrom" and item["bus"].lower() in {"scsi", "sas"}:
-            if shared_scsi_identity is None:
-                shared_scsi_identity = identity_record
-            else:
-                identity_record = deepcopy(shared_scsi_identity)
         entry["identity"] = identity_record
         normalized_storage.append(entry)
-    legacy_ata_disks = [
-        item for item in normalized_storage
-        if item["device"] != "cdrom" and item["bus"] in {"ide", "sata"}
-    ]
-    if len(legacy_ata_disks) > 1:
-        raise RuntimeError(
-            "当前 QEMU/libvirt 后端无法为多块 IDE/SATA 磁盘逐设备传递 model/firmware；"
-            "请保留一块 SATA 盘，其余使用 SCSI/NVMe"
-        )
     generated_uuid = str(uuid.uuid4())
     profile_id = str(uuid.uuid4())
     serials = platform_serials(platform)
@@ -2948,6 +2964,7 @@ def build_record(
                 "ata_major_version": 8,
                 "udma_mode": 6,
                 "ncq": True,
+                "media_policy": "sata-ssd-only",
                 "source": "modern-ahci-profile",
             },
             "cache_kib": cache,
@@ -2969,6 +2986,7 @@ def build_record(
         "storage": {
             "devices": normalized_storage,
             "preserve_current_bus": True,
+            "policy": "single-sata-ssd-v1",
         },
         "devices": {
             "interfaces": interfaces,
