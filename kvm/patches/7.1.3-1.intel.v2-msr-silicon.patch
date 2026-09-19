@@ -1,0 +1,2609 @@
+diff -Naur old/arch/x86/include/asm/kvm_host.h new/arch/x86/include/asm/kvm_host.h
+--- a/arch/x86/include/asm/kvm_host.h	2026-09-19 14:03:02.722527955 +0800
++++ b/arch/x86/include/asm/kvm_host.h	2026-09-19 14:05:10.748991830 +0800
+@@ -832,6 +832,9 @@
+ 	u64 microcode_version;
+ 	u64 arch_capabilities;
+ 	u64 perf_capabilities;
++	u16 ovo_msr_overlay_n;
++	u32 ovo_msr_overlay_idx[256];
++	u64 ovo_msr_overlay_val[256];
+ 
+ 	/*
+ 	 * Paging state of the vcpu
+@@ -1728,6 +1731,54 @@
+ 	u64 preemption_other;
+ 	u64 guest_mode;
+ 	u64 notify_window_exits;
++	u64 cpuid_fastpath;
++	u64 cpuid_fastpath_fallback;
++	u64 cpuid_inner_fastpath;
++	u64 cpuid_inner_cache_miss;
++	u64 cpuid_inner_blockers;
++	u64 cpuid_inner_rfds_skip_armed;
++	u64 cpuid_inner_early_armed;
++	u64 cpuid_dynamic_generation;
++	u64 cpuid_profile_samples;
++	u64 cpuid_profile_validation_cycles;
++	u64 cpuid_profile_lookup_cycles;
++	u64 cpuid_profile_rip_cycles;
++	u64 cpuid_profile_resume_cycles;
++	u64 cpuid_profile_transition_samples;
++	u64 cpuid_profile_transition_cycles;
++	u64 cpuid_profile_transition_min_cycles;
++	u64 cpuid_profile_transition_max_cycles;
++	u64 cpuid_profile_vmcs_valid;
++	u64 cpuid_profile_vm_exit_msr_store_count;
++	u64 cpuid_profile_vm_exit_msr_load_count;
++	u64 cpuid_profile_vm_entry_msr_load_count;
++	u64 cpuid_profile_vm_exit_controls;
++	u64 cpuid_profile_vm_entry_controls;
++	u64 cpuid_profile_primary_exec_controls;
++	u64 cpuid_profile_secondary_exec_controls;
++	u64 cpuid_profile_state_samples;
++	u64 cpuid_profile_state_active_mask;
++	u64 cpuid_profile_state_equal_mask;
++	u64 cpuid_profile_state_perf_active_samples;
++	u64 cpuid_profile_state_perf_equal_samples;
++	u64 cpuid_profile_state_pat_active_samples;
++	u64 cpuid_profile_state_pat_equal_samples;
++	u64 cpuid_profile_state_efer_active_samples;
++	u64 cpuid_profile_state_efer_equal_samples;
++	u64 cpuid_profile_state_cet_active_samples;
++	u64 cpuid_profile_state_cet_equal_samples;
++	u64 cpuid_profile_state_guest_perf_global_ctrl;
++	u64 cpuid_profile_state_host_perf_global_ctrl;
++	u64 cpuid_profile_state_guest_pat;
++	u64 cpuid_profile_state_host_pat;
++	u64 cpuid_profile_state_guest_efer;
++	u64 cpuid_profile_state_host_efer;
++	u64 cpuid_profile_state_guest_s_cet;
++	u64 cpuid_profile_state_host_s_cet;
++	u64 cpuid_profile_state_guest_ssp;
++	u64 cpuid_profile_state_host_ssp;
++	u64 cpuid_profile_state_guest_intr_ssp_table;
++	u64 cpuid_profile_state_host_intr_ssp_table;
+ };
+ 
+ struct x86_instruction_info;
+diff -Naur old/arch/x86/include/uapi/asm/kvm.h new/arch/x86/include/uapi/asm/kvm.h
+--- a/arch/x86/include/uapi/asm/kvm.h	2026-09-19 14:03:02.723392788 +0800
++++ b/arch/x86/include/uapi/asm/kvm.h	2026-09-19 08:11:26.478620142 +0800
+@@ -79,7 +79,7 @@
+ 	__u8 elcr_mask;
+ };
+ 
+-#define KVM_IOAPIC_NUM_PINS  24
++#define KVM_IOAPIC_NUM_PINS  32
+ struct kvm_ioapic_state {
+ 	__u64 base_address;
+ 	__u32 ioregsel;
+diff -Naur old/arch/x86/kvm/cpuid.c new/arch/x86/kvm/cpuid.c
+--- a/arch/x86/kvm/cpuid.c	2026-09-19 14:03:02.723491627 +0800
++++ b/arch/x86/kvm/cpuid.c	2026-09-19 08:11:26.478620142 +0800
+@@ -84,49 +84,23 @@
+ 	return ret;
+ }
+ 
+-struct kvm_cpuid_entry2 *kvm_find_cpuid_entry2(
++static struct kvm_cpuid_entry2 *__kvm_find_cpuid_entry2(
+ 	struct kvm_cpuid_entry2 *entries, int nent, u32 function, u64 index)
+ {
+ 	struct kvm_cpuid_entry2 *e;
+ 	int i;
+ 
+-	/*
+-	 * KVM has a semi-arbitrary rule that querying the guest's CPUID model
+-	 * with IRQs disabled is disallowed.  The CPUID model can legitimately
+-	 * have over one hundred entries, i.e. the lookup is slow, and IRQs are
+-	 * typically disabled in KVM only when KVM is in a performance critical
+-	 * path, e.g. the core VM-Enter/VM-Exit run loop.  Nothing will break
+-	 * if this rule is violated, this assertion is purely to flag potential
+-	 * performance issues.  If this fires, consider moving the lookup out
+-	 * of the hotpath, e.g. by caching information during CPUID updates.
+-	 */
+-	lockdep_assert_irqs_enabled();
+-
+ 	for (i = 0; i < nent; i++) {
+ 		e = &entries[i];
+ 
+ 		if (e->function != function)
+ 			continue;
+ 
+-		/*
+-		 * If the index isn't significant, use the first entry with a
+-		 * matching function.  It's userspace's responsibility to not
+-		 * provide "duplicate" entries in all cases.
+-		 */
++		/* Preserve first-match semantics, including userspace duplicates. */
+ 		if (!(e->flags & KVM_CPUID_FLAG_SIGNIFCANT_INDEX) || e->index == index)
+ 			return e;
+ 
+-
+-		/*
+-		 * Similarly, use the first matching entry if KVM is doing a
+-		 * lookup (as opposed to emulating CPUID) for a function that's
+-		 * architecturally defined as not having a significant index.
+-		 */
+ 		if (index == KVM_CPUID_INDEX_NOT_SIGNIFICANT) {
+-			/*
+-			 * Direct lookups from KVM should not diverge from what
+-			 * KVM defines internally (the architectural behavior).
+-			 */
+ 			WARN_ON_ONCE(cpuid_function_is_indexed(function));
+ 			return e;
+ 		}
+@@ -134,8 +108,38 @@
+ 
+ 	return NULL;
+ }
++
++struct kvm_cpuid_entry2 *kvm_find_cpuid_entry2(
++	struct kvm_cpuid_entry2 *entries, int nent, u32 function, u64 index)
++{
++	/*
++	 * KVM has a semi-arbitrary rule that querying the guest's CPUID model
++	 * with IRQs disabled is disallowed.  The CPUID model can legitimately
++	 * have over one hundred entries, i.e. the lookup is slow, and IRQs are
++	 * typically disabled in KVM only when KVM is in a performance critical
++	 * path, e.g. the core VM-Enter/VM-Exit run loop.  Nothing will break
++	 * if this rule is violated, this assertion is purely to flag potential
++	 * performance issues.  If this fires, consider moving the lookup out
++	 * of the hotpath, e.g. by caching information during CPUID updates.
++	 */
++	lockdep_assert_irqs_enabled();
++
++	return __kvm_find_cpuid_entry2(entries, nent, function, index);
++}
+ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_find_cpuid_entry2);
+ 
++/*
++ * CPUID emulation deliberately queries the model in the IRQ-off re-entry
++ * loop. The vCPU owns this bounded array and cannot replace it during RUN.
++ * Keep the IRQ-enabled performance assertion for all ordinary KVM lookups.
++ */
++static struct kvm_cpuid_entry2 *kvm_find_cpuid_entry_emulated(
++	struct kvm_vcpu *vcpu, u32 function, u64 index)
++{
++	return __kvm_find_cpuid_entry2(vcpu->arch.cpuid_entries,
++				      vcpu->arch.cpuid_nent, function, index);
++}
++
+ static int kvm_check_cpuid(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_cpuid_entry2 *best;
+@@ -321,6 +325,7 @@
+ 		     cpuid_entry_has(best, X86_FEATURE_XSAVEC)))
+ 		best->ebx = xstate_required_size(vcpu->arch.xcr0 |
+ 						 vcpu->arch.ia32_xss, true);
++	vcpu->stat.cpuid_dynamic_generation++;
+ }
+ 
+ static bool kvm_cpuid_has_hyperv(struct kvm_vcpu *vcpu)
+@@ -2051,7 +2056,7 @@
+ 	struct kvm_cpuid_entry2 *basic, *class;
+ 	u32 function = *fn_ptr;
+ 
+-	basic = kvm_find_cpuid_entry(vcpu, 0);
++	basic = kvm_find_cpuid_entry_emulated(vcpu, 0, KVM_CPUID_INDEX_NOT_SIGNIFICANT);
+ 	if (!basic)
+ 		return NULL;
+ 
+@@ -2060,11 +2065,14 @@
+ 		return NULL;
+ 
+ 	if (function >= 0x40000000 && function <= 0x4fffffff)
+-		class = kvm_find_cpuid_entry(vcpu, function & 0xffffff00);
++		class = kvm_find_cpuid_entry_emulated(vcpu, function & 0xffffff00,
++						    KVM_CPUID_INDEX_NOT_SIGNIFICANT);
+ 	else if (function >= 0xc0000000)
+-		class = kvm_find_cpuid_entry(vcpu, 0xc0000000);
++		class = kvm_find_cpuid_entry_emulated(vcpu, 0xc0000000,
++						    KVM_CPUID_INDEX_NOT_SIGNIFICANT);
+ 	else
+-		class = kvm_find_cpuid_entry(vcpu, function & 0x80000000);
++		class = kvm_find_cpuid_entry_emulated(vcpu, function & 0x80000000,
++						    KVM_CPUID_INDEX_NOT_SIGNIFICANT);
+ 
+ 	if (class && function <= class->eax)
+ 		return NULL;
+@@ -2082,7 +2090,45 @@
+ 	 * the effective CPUID entry is the max basic leaf.  Note, the index of
+ 	 * the original requested leaf is observed!
+ 	 */
+-	return kvm_find_cpuid_entry_index(vcpu, basic->eax, index);
++	return kvm_find_cpuid_entry_emulated(vcpu, basic->eax, index);
++}
++
++void kvm_trace_cpuid(u32 function, u32 index, u32 eax, u32 ebx,
++		     u32 ecx, u32 edx, bool exact, bool used_max_basic)
++{
++	trace_kvm_cpuid(function, index, eax, ebx, ecx, edx, exact,
++			used_max_basic);
++}
++EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_trace_cpuid);
++
++bool kvm_cpuid_trace_enabled(void)
++{
++	return trace_kvm_cpuid_enabled();
++}
++EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_cpuid_trace_enabled);
++
++/*
++ * Host-fill clock/power identity.  0x06 keeps HWP but not HFI/ITD.
++ * 0x1A is native core type (P=0x40 / E=0x20); CPU-Z still used ACPI*800
++ * BCLK while 0x15/0x16 were filled and 0x1A was zero.
++ */
++static bool ovo_cpuid_host_leaf(struct kvm_vcpu *vcpu, u32 function)
++{
++	struct kvm_cpuid_entry2 *limit;
++
++	switch (function) {
++	case 0x06:
++	case 0x15:
++	case 0x16:
++	case 0x1a:
++		break;
++	default:
++		return false;
++	}
++
++	limit = kvm_find_cpuid_entry_emulated(vcpu, 0,
++			KVM_CPUID_INDEX_NOT_SIGNIFICANT);
++	return limit && function <= limit->eax;
+ }
+ 
+ bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
+@@ -2095,7 +2141,18 @@
+ 	if (vcpu->arch.cpuid_dynamic_bits_dirty)
+ 		kvm_update_cpuid_runtime(vcpu);
+ 
+-	entry = kvm_find_cpuid_entry_index(vcpu, function, index);
++	if (ovo_cpuid_host_leaf(vcpu, function)) {
++		cpuid_count(function, index, eax, ebx, ecx, edx);
++		if (function == 0x06) {
++			*eax &= ~((1u << 19) | (1u << 23));
++			*edx &= 0x7f;
++		}
++		kvm_trace_cpuid(orig_function, index, *eax, *ebx, *ecx, *edx,
++				true, false);
++		return true;
++	}
++
++	entry = kvm_find_cpuid_entry_emulated(vcpu, function, index);
+ 	exact = !!entry;
+ 
+ 	if (!entry && !exact_only) {
+@@ -2144,14 +2201,14 @@
+ 		 * exists. EDX can be copied from any existing index.
+ 		 */
+ 		if (function == 0xb || function == 0x1f) {
+-			entry = kvm_find_cpuid_entry_index(vcpu, function, 1);
++			entry = kvm_find_cpuid_entry_emulated(vcpu, function, 1);
+ 			if (entry) {
+ 				*ecx = index & 0xff;
+ 				*edx = entry->edx;
+ 			}
+ 		}
+ 	}
+-	trace_kvm_cpuid(orig_function, index, *eax, *ebx, *ecx, *edx, exact,
++	kvm_trace_cpuid(orig_function, index, *eax, *ebx, *ecx, *edx, exact,
+ 			used_max_basic);
+ 	return exact;
+ }
+diff -Naur old/arch/x86/kvm/cpuid.h new/arch/x86/kvm/cpuid.h
+--- a/arch/x86/kvm/cpuid.h	2026-09-19 14:03:02.724226179 +0800
++++ b/arch/x86/kvm/cpuid.h	2026-09-19 08:11:26.478680343 +0800
+@@ -61,6 +61,9 @@
+ 			      struct kvm_cpuid_entry2 __user *entries);
+ bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
+ 	       u32 *ecx, u32 *edx, bool exact_only);
++void kvm_trace_cpuid(u32 function, u32 index, u32 eax, u32 ebx,
++		     u32 ecx, u32 edx, bool exact, bool used_max_basic);
++bool kvm_cpuid_trace_enabled(void);
+ 
+ void __init kvm_init_xstate_sizes(void);
+ u32 xstate_required_size(u64 xstate_bv, bool compacted);
+diff -Naur old/arch/x86/kvm/debugfs.c new/arch/x86/kvm/debugfs.c
+--- a/arch/x86/kvm/debugfs.c	2026-09-19 14:03:02.724569476 +0800
++++ b/arch/x86/kvm/debugfs.c	2026-09-19 08:11:26.478698154 +0800
+@@ -62,6 +62,130 @@
+ 			    &vcpu_guest_mode_fops);
+ 	debugfs_create_file("tsc-offset", 0444, debugfs_dentry, vcpu,
+ 			    &vcpu_tsc_offset_fops);
++	debugfs_create_u64("cpuid_inner_fastpath", 0444, debugfs_dentry,
++			   &vcpu->stat.cpuid_inner_fastpath);
++	debugfs_create_u64("cpuid_inner_cache_miss", 0444, debugfs_dentry,
++			   &vcpu->stat.cpuid_inner_cache_miss);
++	debugfs_create_u64("cpuid_inner_blockers", 0444, debugfs_dentry,
++			   &vcpu->stat.cpuid_inner_blockers);
++	debugfs_create_u64("cpuid_inner_rfds_skip_armed", 0444, debugfs_dentry,
++			   &vcpu->stat.cpuid_inner_rfds_skip_armed);
++	debugfs_create_u64("cpuid_inner_early_armed", 0444, debugfs_dentry,
++			   &vcpu->stat.cpuid_inner_early_armed);
++	debugfs_create_u64("cpuid_profile_samples", 0444, debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_samples);
++	debugfs_create_u64("cpuid_profile_validation_cycles", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_validation_cycles);
++	debugfs_create_u64("cpuid_profile_lookup_cycles", 0444, debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_lookup_cycles);
++	debugfs_create_u64("cpuid_profile_rip_cycles", 0444, debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_rip_cycles);
++	debugfs_create_u64("cpuid_profile_resume_cycles", 0444, debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_resume_cycles);
++	debugfs_create_u64("cpuid_profile_transition_samples", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_transition_samples);
++	debugfs_create_u64("cpuid_profile_transition_cycles", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_transition_cycles);
++	debugfs_create_u64("cpuid_profile_transition_min_cycles", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_transition_min_cycles);
++	debugfs_create_u64("cpuid_profile_transition_max_cycles", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_transition_max_cycles);
++	debugfs_create_u64("cpuid_profile_vmcs_valid", 0444, debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_vmcs_valid);
++	debugfs_create_u64("cpuid_profile_vm_exit_msr_store_count", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_vm_exit_msr_store_count);
++	debugfs_create_u64("cpuid_profile_vm_exit_msr_load_count", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_vm_exit_msr_load_count);
++	debugfs_create_u64("cpuid_profile_vm_entry_msr_load_count", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_vm_entry_msr_load_count);
++	debugfs_create_u64("cpuid_profile_vm_exit_controls", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_vm_exit_controls);
++	debugfs_create_u64("cpuid_profile_vm_entry_controls", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_vm_entry_controls);
++	debugfs_create_u64("cpuid_profile_primary_exec_controls", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_primary_exec_controls);
++	debugfs_create_u64("cpuid_profile_secondary_exec_controls", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_secondary_exec_controls);
++	debugfs_create_u64("cpuid_profile_state_samples", 0444, debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_samples);
++	debugfs_create_u64("cpuid_profile_state_active_mask", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_active_mask);
++	debugfs_create_u64("cpuid_profile_state_equal_mask", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_equal_mask);
++	debugfs_create_u64("cpuid_profile_state_perf_active_samples", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_perf_active_samples);
++	debugfs_create_u64("cpuid_profile_state_perf_equal_samples", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_perf_equal_samples);
++	debugfs_create_u64("cpuid_profile_state_pat_active_samples", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_pat_active_samples);
++	debugfs_create_u64("cpuid_profile_state_pat_equal_samples", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_pat_equal_samples);
++	debugfs_create_u64("cpuid_profile_state_efer_active_samples", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_efer_active_samples);
++	debugfs_create_u64("cpuid_profile_state_efer_equal_samples", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_efer_equal_samples);
++	debugfs_create_u64("cpuid_profile_state_cet_active_samples", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_cet_active_samples);
++	debugfs_create_u64("cpuid_profile_state_cet_equal_samples", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_cet_equal_samples);
++	debugfs_create_u64("cpuid_profile_state_guest_perf_global_ctrl", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_guest_perf_global_ctrl);
++	debugfs_create_u64("cpuid_profile_state_host_perf_global_ctrl", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_host_perf_global_ctrl);
++	debugfs_create_u64("cpuid_profile_state_guest_pat", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_guest_pat);
++	debugfs_create_u64("cpuid_profile_state_host_pat", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_host_pat);
++	debugfs_create_u64("cpuid_profile_state_guest_efer", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_guest_efer);
++	debugfs_create_u64("cpuid_profile_state_host_efer", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_host_efer);
++	debugfs_create_u64("cpuid_profile_state_guest_s_cet", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_guest_s_cet);
++	debugfs_create_u64("cpuid_profile_state_host_s_cet", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_host_s_cet);
++	debugfs_create_u64("cpuid_profile_state_guest_ssp", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_guest_ssp);
++	debugfs_create_u64("cpuid_profile_state_host_ssp", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_host_ssp);
++	debugfs_create_u64("cpuid_profile_state_guest_intr_ssp_table", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_guest_intr_ssp_table);
++	debugfs_create_u64("cpuid_profile_state_host_intr_ssp_table", 0444,
++			   debugfs_dentry,
++			   &vcpu->stat.cpuid_profile_state_host_intr_ssp_table);
+ 
+ 	if (lapic_in_kernel(vcpu))
+ 		debugfs_create_file("lapic_timer_advance_ns", 0444,
+diff -Naur old/arch/x86/kvm/ioapic.h new/arch/x86/kvm/ioapic.h
+--- a/arch/x86/kvm/ioapic.h	2026-09-19 14:03:02.724739079 +0800
++++ b/arch/x86/kvm/ioapic.h	2026-09-19 08:11:26.478717825 +0800
+@@ -12,7 +12,7 @@
+ struct kvm_vcpu;
+ 
+ #define IOAPIC_NUM_PINS  KVM_IOAPIC_NUM_PINS
+-#define IOAPIC_VERSION_ID 0x11	/* IOAPIC version */
++#define IOAPIC_VERSION_ID 0x20	/* IOAPIC version */
+ #define IOAPIC_EDGE_TRIG  0
+ #define IOAPIC_LEVEL_TRIG 1
+ 
+diff -Naur old/arch/x86/kvm/kvm-asm-offsets.c new/arch/x86/kvm/kvm-asm-offsets.c
+--- a/arch/x86/kvm/kvm-asm-offsets.c	2026-09-19 14:03:02.724908757 +0800
++++ b/arch/x86/kvm/kvm-asm-offsets.c	2026-09-19 08:11:26.478732888 +0800
+@@ -25,5 +25,68 @@
+ 	if (IS_ENABLED(CONFIG_KVM_INTEL)) {
+ 		BLANK();
+ 		OFFSET(VMX_spec_ctrl, vcpu_vmx, spec_ctrl);
++		OFFSET(VMX_loaded_vmcs, vcpu_vmx, loaded_vmcs);
++		OFFSET(VMX_cpuid_fast_cache, vcpu_vmx, cpuid_fast_cache);
++		OFFSET(VMX_cpuid_fast_mru, vcpu_vmx, cpuid_fast_mru);
++		OFFSET(VMX_stat_exits, vcpu_vmx, vcpu.stat.exits);
++		OFFSET(VMX_stat_cpuid_fastpath, vcpu_vmx,
++		       vcpu.stat.cpuid_fastpath);
++		OFFSET(VMX_stat_cpuid_inner_fastpath, vcpu_vmx,
++		       vcpu.stat.cpuid_inner_fastpath);
++		OFFSET(VMX_stat_cpuid_inner_cache_miss, vcpu_vmx,
++		       vcpu.stat.cpuid_inner_cache_miss);
++		OFFSET(VMX_cpuid_profile_tsc_start, vcpu_vmx,
++		       cpuid_profile_tsc_start);
++		OFFSET(VMX_cpuid_profile_tsc_validation, vcpu_vmx,
++		       cpuid_profile_tsc_validation);
++		OFFSET(VMX_cpuid_profile_tsc_lookup, vcpu_vmx,
++		       cpuid_profile_tsc_lookup);
++		OFFSET(VMX_cpuid_profile_tsc_rip, vcpu_vmx,
++		       cpuid_profile_tsc_rip);
++		OFFSET(VMX_cpuid_profile_tsc_resume, vcpu_vmx,
++		       cpuid_profile_tsc_resume);
++		OFFSET(VMX_cpuid_profile_divider, vcpu_vmx,
++		       cpuid_profile_divider);
++		OFFSET(VMX_cpuid_profile_transition_tsc_start, vcpu_vmx,
++		       cpuid_profile_transition_tsc_start);
++		OFFSET(VMX_cpuid_profile_transition_elapsed, vcpu_vmx,
++		       cpuid_profile_transition_elapsed);
++		OFFSET(VMX_cpuid_profile_transition_armed, vcpu_vmx,
++		       cpuid_profile_transition_armed);
++		OFFSET(VMX_cpuid_profile_transition_ready, vcpu_vmx,
++		       cpuid_profile_transition_ready);
++		OFFSET(VMX_stat_cpuid_profile_samples, vcpu_vmx,
++		       vcpu.stat.cpuid_profile_samples);
++		OFFSET(VMX_stat_cpuid_profile_validation_cycles, vcpu_vmx,
++		       vcpu.stat.cpuid_profile_validation_cycles);
++		OFFSET(VMX_stat_cpuid_profile_lookup_cycles, vcpu_vmx,
++		       vcpu.stat.cpuid_profile_lookup_cycles);
++		OFFSET(VMX_stat_cpuid_profile_rip_cycles, vcpu_vmx,
++		       vcpu.stat.cpuid_profile_rip_cycles);
++		OFFSET(VMX_stat_cpuid_profile_resume_cycles, vcpu_vmx,
++		       vcpu.stat.cpuid_profile_resume_cycles);
++		OFFSET(VMX_stat_cpuid_profile_transition_samples, vcpu_vmx,
++		       vcpu.stat.cpuid_profile_transition_samples);
++		OFFSET(VMX_stat_cpuid_profile_transition_cycles, vcpu_vmx,
++		       vcpu.stat.cpuid_profile_transition_cycles);
++		OFFSET(VMX_stat_cpuid_profile_transition_min_cycles, vcpu_vmx,
++		       vcpu.stat.cpuid_profile_transition_min_cycles);
++		OFFSET(VMX_stat_cpuid_profile_transition_max_cycles, vcpu_vmx,
++		       vcpu.stat.cpuid_profile_transition_max_cycles);
++		OFFSET(LOADED_VMCS_launched, loaded_vmcs, launched);
++		OFFSET(VMX_CPUID_CACHE_function, vmx_cpuid_fast_cache_entry,
++		       function);
++		OFFSET(VMX_CPUID_CACHE_index, vmx_cpuid_fast_cache_entry, index);
++		OFFSET(VMX_CPUID_CACHE_eax, vmx_cpuid_fast_cache_entry, eax);
++		OFFSET(VMX_CPUID_CACHE_ebx, vmx_cpuid_fast_cache_entry, ebx);
++		OFFSET(VMX_CPUID_CACHE_ecx, vmx_cpuid_fast_cache_entry, ecx);
++		OFFSET(VMX_CPUID_CACHE_edx, vmx_cpuid_fast_cache_entry, edx);
++		OFFSET(VMX_CPUID_CACHE_flags, vmx_cpuid_fast_cache_entry, flags);
++		DEFINE(VMX_CPUID_CACHE_entry_size,
++		       sizeof(struct vmx_cpuid_fast_cache_entry));
++		DEFINE(VMX_CPUID_CACHE_mask, VMX_CPUID_FAST_CACHE_SIZE - 1);
++		DEFINE(VMX_CPUID_CACHE_probes, VMX_CPUID_FAST_CACHE_PROBES);
++		DEFINE(VMX_CPUID_CACHE_valid, VMX_CPUID_FAST_CACHE_VALID);
++		DEFINE(VMX_CPUID_CACHE_indexed, VMX_CPUID_FAST_CACHE_INDEXED);
+ 	}
+ }
+diff -Naur old/arch/x86/kvm/lapic.c new/arch/x86/kvm/lapic.c
+--- a/arch/x86/kvm/lapic.c	2026-09-19 14:03:02.725429319 +0800
++++ b/arch/x86/kvm/lapic.c	2026-09-19 08:11:26.478748618 +0800
+@@ -54,7 +54,7 @@
+ #endif
+ 
+ /* 14 is the version for Xeon and Pentium 8.4.8*/
+-#define APIC_VERSION			0x14UL
++#define APIC_VERSION			0x15UL
+ #define LAPIC_MMIO_LENGTH		(1 << 12)
+ 
+ /*
+diff -Naur old/arch/x86/kvm/pmu.c new/arch/x86/kvm/pmu.c
+--- a/arch/x86/kvm/pmu.c	2026-09-19 14:03:02.726441130 +0800
++++ b/arch/x86/kvm/pmu.c	2026-09-19 08:11:26.478791767 +0800
+@@ -11,6 +11,10 @@
+  */
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/cpu.h>
++#include <linux/cpumask.h>
++#include <linux/module.h>
++#include <linux/smp.h>
+ #include <linux/types.h>
+ #include <linux/kvm_host.h>
+ #include <linux/perf_event.h>
+@@ -18,6 +22,8 @@
+ #include <linux/sort.h>
+ #include <asm/perf_event.h>
+ #include <asm/cpu_device_id.h>
++#include <asm/intel-family.h>
++#include <asm/msr.h>
+ #include "x86.h"
+ #include "cpuid.h"
+ #include "lapic.h"
+@@ -29,6 +35,118 @@
+ /* Unadultered PMU capabilities of the host, i.e. of hardware. */
+ static struct x86_pmu_capability __read_mostly kvm_host_pmu;
+ 
++static bool __read_mostly allow_hybrid_pmu = true;
++module_param(allow_hybrid_pmu, bool, 0444);
++MODULE_PARM_DESC(allow_hybrid_pmu,
++		 "Enable the mediated vPMU using uniform Intel P-core capabilities");
++
++struct kvm_hybrid_pmu_sample {
++	u32 core_type;
++	u32 eax;
++	u32 ebx;
++	u32 edx;
++	u64 perf_capabilities;
++};
++
++static void kvm_read_hybrid_pmu_sample(void *data)
++{
++	struct kvm_hybrid_pmu_sample *sample = data;
++	u32 ecx;
++
++	if (cpuid_eax(0) < 0x1a)
++		return;
++
++	sample->core_type = cpuid_eax(0x1a) >> 24;
++	if (sample->core_type != INTEL_CPU_TYPE_CORE)
++		return;
++
++	cpuid_count(0x0a, 0, &sample->eax, &sample->ebx, &ecx, &sample->edx);
++	if (boot_cpu_has(X86_FEATURE_PDCM))
++		rdmsrq(MSR_IA32_PERF_CAPABILITIES, sample->perf_capabilities);
++}
++
++static bool kvm_get_hybrid_pcore_pmu(struct x86_pmu_capability *cap)
++{
++	struct kvm_hybrid_pmu_sample reference = {};
++	struct kvm_hybrid_pmu_sample sample;
++	cpumask_var_t pcore_mask;
++	bool found = false;
++	int cpu, ret;
++
++	if (!zalloc_cpumask_var(&pcore_mask, GFP_KERNEL))
++		return false;
++
++	cpus_read_lock();
++	for_each_online_cpu(cpu) {
++		memset(&sample, 0, sizeof(sample));
++		ret = smp_call_function_single(cpu, kvm_read_hybrid_pmu_sample,
++					       &sample, true);
++		if (ret) {
++			pr_warn("failed to read PMU capability on CPU %d: %d\n",
++				cpu, ret);
++			goto incompatible;
++		}
++
++		if (sample.core_type != INTEL_CPU_TYPE_CORE)
++			continue;
++
++		cpumask_set_cpu(cpu, pcore_mask);
++		if (!found) {
++			reference = sample;
++			found = true;
++			continue;
++		}
++
++		if (sample.eax != reference.eax ||
++		    sample.ebx != reference.ebx ||
++		    sample.edx != reference.edx ||
++		    sample.perf_capabilities != reference.perf_capabilities) {
++			pr_warn("P-core PMU capability differs on CPU %d\n", cpu);
++			goto incompatible;
++		}
++	}
++
++	if (!found || !(reference.eax & 0xff) ||
++	    !((reference.eax >> 8) & 0xff) ||
++	    !((reference.eax >> 16) & 0xff) ||
++	    ((reference.eax >> 16) & 0xff) > 64 ||
++	    ((reference.eax >> 24) & 0xff) > 32 ||
++	    ((reference.edx >> 5) & 0xff) > 64 ||
++	    ((reference.edx & 0x1f) && !((reference.edx >> 5) & 0xff))) {
++		pr_warn("no uniform, valid Intel P-core PMU capability found\n");
++		goto incompatible;
++	}
++
++	cap->version = reference.eax & 0xff;
++	cap->num_counters_gp = (reference.eax >> 8) & 0xff;
++	cap->bit_width_gp = (reference.eax >> 16) & 0xff;
++	cap->events_mask_len = (reference.eax >> 24) & 0xff;
++	cap->events_mask = reference.ebx;
++	cap->num_counters_fixed = reference.edx & 0x1f;
++	cap->bit_width_fixed = (reference.edx >> 5) & 0xff;
++	cap->pebs_ept = 0;
++	cap->mediated = cap->version >= 4 &&
++			  reference.perf_capabilities & PERF_CAP_FW_WRITES;
++
++	pr_info("mediated hybrid vPMU validated P-core CPUs: %*pbl\n",
++		cpumask_pr_args(pcore_mask));
++	pr_info("P-core PMU capability: v%d, %d GP/%d fixed counters, %d-bit\n",
++		cap->version, cap->num_counters_gp,
++		cap->num_counters_fixed, cap->bit_width_gp);
++	if (!cap->mediated)
++		pr_warn("P-core PMU lacks mediated-vPMU prerequisites; using the perf-backed vPMU\n");
++
++	cpus_read_unlock();
++	free_cpumask_var(pcore_mask);
++	return true;
++
++incompatible:
++	cpus_read_unlock();
++	free_cpumask_var(pcore_mask);
++	memset(cap, 0, sizeof(*cap));
++	return false;
++}
++
+ /* KVM's PMU capabilities, i.e. the intersection of KVM and hardware support. */
+ struct x86_pmu_capability __read_mostly kvm_pmu_cap;
+ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_pmu_cap);
+@@ -115,10 +233,18 @@
+ 	 * for hybrid PMUs until KVM gains a way to let userspace opt-in.
+ 	 */
+ 	if (cpu_feature_enabled(X86_FEATURE_HYBRID_CPU)) {
+-		enable_pmu = false;
+-		memset(&kvm_host_pmu, 0, sizeof(kvm_host_pmu));
++		if (!enable_pmu || !allow_hybrid_pmu ||
++		    !kvm_get_hybrid_pcore_pmu(&kvm_host_pmu)) {
++			enable_pmu = false;
++			memset(&kvm_host_pmu, 0, sizeof(kvm_host_pmu));
++		} else {
++			/* P-core pinning is an explicit deployment requirement. */
++			enable_mediated_pmu = true;
++		}
+ 	} else {
+ 		perf_get_x86_pmu_capability(&kvm_host_pmu);
++		if (is_intel && enable_pmu)
++			enable_mediated_pmu = true;
+ 	}
+ 
+ 	if (enable_pmu) {
+@@ -138,6 +264,8 @@
+ 	if (!enable_pmu || !enable_mediated_pmu || !kvm_host_pmu.mediated ||
+ 	    !pmu_ops->is_mediated_pmu_supported(&kvm_host_pmu))
+ 		enable_mediated_pmu = false;
++	else if (is_intel)
++		pr_info("mediated vPMU enabled automatically\n");
+ 
+ 	if (!enable_mediated_pmu)
+ 		pmu_ops->write_global_ctrl = NULL;
+diff -Naur old/arch/x86/kvm/vmx/pmu_intel.c new/arch/x86/kvm/vmx/pmu_intel.c
+--- a/arch/x86/kvm/vmx/pmu_intel.c	2026-09-19 14:03:02.727013315 +0800
++++ b/arch/x86/kvm/vmx/pmu_intel.c	2026-09-19 08:11:26.478791767 +0800
+@@ -760,7 +760,10 @@
+ {
+ 	u64 host_perf_cap = 0;
+ 
+-	if (boot_cpu_has(X86_FEATURE_PDCM))
++	/* Hybrid capabilities were sampled directly on every online P-core. */
++	if (cpu_feature_enabled(X86_FEATURE_HYBRID_CPU))
++		host_perf_cap = host_pmu->mediated ? PERF_CAP_FW_WRITES : 0;
++	else if (boot_cpu_has(X86_FEATURE_PDCM))
+ 		rdmsrq(MSR_IA32_PERF_CAPABILITIES, host_perf_cap);
+ 
+ 	/*
+diff -Naur old/arch/x86/kvm/vmx/run_flags.h new/arch/x86/kvm/vmx/run_flags.h
+--- a/arch/x86/kvm/vmx/run_flags.h	2026-09-19 14:03:02.727318535 +0800
++++ b/arch/x86/kvm/vmx/run_flags.h	2026-09-19 08:11:26.478844959 +0800
+@@ -5,5 +5,13 @@
+ #define VMX_RUN_VMRESUME			BIT(0)
+ #define VMX_RUN_SAVE_SPEC_CTRL			BIT(1)
+ #define VMX_RUN_CLEAR_CPU_BUFFERS_FOR_MMIO	BIT(2)
++#define VMX_RUN_CPUID_INNER_FASTPATH		BIT(3)
++#define VMX_RUN_CPUID_INNER_SKIP_RFDS_VERW	BIT(4)
++#define VMX_RUN_CPUID_INNER_EARLY		BIT(5)
++/* Transient assembly-only validation state, cleared before the slow path. */
++#define VMX_RUN_CPUID_INNER_EARLY_VALIDATED	BIT(6)
++#define VMX_RUN_CPUID_INNER_EARLY_REJECTED	BIT(7)
++#define VMX_RUN_CPUID_PROFILE			BIT(8)
++#define VMX_RUN_CPUID_PROFILE_SAMPLE		BIT(9)
+ 
+ #endif /* __KVM_X86_VMX_RUN_FLAGS_H */
+diff -Naur old/arch/x86/kvm/vmx/vmenter.S new/arch/x86/kvm/vmx/vmenter.S
+--- a/arch/x86/kvm/vmx/vmenter.S	2026-09-19 14:03:02.727693729 +0800
++++ b/arch/x86/kvm/vmx/vmenter.S	2026-09-19 08:11:26.478860657 +0800
+@@ -11,6 +11,139 @@
+ 
+ #define WORD_SIZE (BITS_PER_LONG / 8)
+ 
++#ifdef CONFIG_X86_64
++/* Profiling is sampled and opt-in; each mark preserves guest registers. */
++/* Store cumulative endpoints and commit only a complete direct hit. */
++.macro CPUID_PROFILE_MARK tsc_field, flags_off, vmx_off
++	testl $VMX_RUN_CPUID_PROFILE_SAMPLE, (\flags_off)(%_ASM_SP)
++	jz .Lcpuid_profile_skip_\@
++	push %_ASM_AX
++	push %_ASM_DX
++	push %_ASM_DI
++	lfence
++	rdtsc
++	shl $32, %_ASM_DX
++	or %_ASM_DX, %_ASM_AX
++	mov (\vmx_off+3*WORD_SIZE)(%_ASM_SP), %_ASM_DI
++	sub VMX_cpuid_profile_tsc_start(%_ASM_DI), %_ASM_AX
++	mov %_ASM_AX, \tsc_field(%_ASM_DI)
++	pop %_ASM_DI
++	pop %_ASM_DX
++	pop %_ASM_AX
++.Lcpuid_profile_skip_\@:
++.endm
++
++#define CPUID_PROFILE_MARK_VALIDATION(flags_off, vmx_off) \
++	CPUID_PROFILE_MARK VMX_cpuid_profile_tsc_validation, flags_off, vmx_off
++#define CPUID_PROFILE_MARK_LOOKUP(flags_off, vmx_off) \
++	CPUID_PROFILE_MARK VMX_cpuid_profile_tsc_lookup, flags_off, vmx_off
++#define CPUID_PROFILE_MARK_RIP(flags_off, vmx_off) \
++	CPUID_PROFILE_MARK VMX_cpuid_profile_tsc_rip, flags_off, vmx_off
++#define CPUID_PROFILE_MARK_RESUME(flags_off, vmx_off) \
++	CPUID_PROFILE_MARK VMX_cpuid_profile_tsc_resume, flags_off, vmx_off
++
++.macro CPUID_PROFILE_COMMIT flags_off, vmx_off
++	testl $VMX_RUN_CPUID_PROFILE_SAMPLE, (\flags_off)(%_ASM_SP)
++	jz .Lcpuid_profile_commit_skip_\@
++	push %_ASM_AX
++	push %_ASM_DX
++	push %_ASM_DI
++	mov (\vmx_off+3*WORD_SIZE)(%_ASM_SP), %_ASM_DI
++	mov VMX_cpuid_profile_tsc_validation(%_ASM_DI), %_ASM_AX
++	add %_ASM_AX, VMX_stat_cpuid_profile_validation_cycles(%_ASM_DI)
++	mov VMX_cpuid_profile_tsc_lookup(%_ASM_DI), %_ASM_AX
++	add %_ASM_AX, VMX_stat_cpuid_profile_lookup_cycles(%_ASM_DI)
++	mov VMX_cpuid_profile_tsc_rip(%_ASM_DI), %_ASM_AX
++	add %_ASM_AX, VMX_stat_cpuid_profile_rip_cycles(%_ASM_DI)
++	mov VMX_cpuid_profile_tsc_resume(%_ASM_DI), %_ASM_AX
++	add %_ASM_AX, VMX_stat_cpuid_profile_resume_cycles(%_ASM_DI)
++	incq VMX_stat_cpuid_profile_samples(%_ASM_DI)
++	pop %_ASM_DI
++	pop %_ASM_DX
++	pop %_ASM_AX
++.Lcpuid_profile_commit_skip_\@:
++.endm
++
++/* Measure from a sampled direct VMRESUME to the following VMEXIT boundary. */
++.macro CPUID_PROFILE_TRANSITION_CAPTURE flags_off, vmx_off
++	testl $VMX_RUN_CPUID_PROFILE, (\flags_off)(%_ASM_SP)
++	jz .Lcpuid_profile_transition_capture_skip_\@
++	push %_ASM_AX
++	push %_ASM_DX
++	push %_ASM_DI
++	mov (\vmx_off+3*WORD_SIZE)(%_ASM_SP), %_ASM_DI
++	movl $0, VMX_cpuid_profile_transition_ready(%_ASM_DI)
++	cmpl $0, VMX_cpuid_profile_transition_armed(%_ASM_DI)
++	je .Lcpuid_profile_transition_capture_restore_\@
++	movl $0, VMX_cpuid_profile_transition_armed(%_ASM_DI)
++	lfence
++	rdtsc
++	shl $32, %_ASM_DX
++	or %_ASM_DX, %_ASM_AX
++	sub VMX_cpuid_profile_transition_tsc_start(%_ASM_DI), %_ASM_AX
++	mov %_ASM_AX, VMX_cpuid_profile_transition_elapsed(%_ASM_DI)
++	movl $1, VMX_cpuid_profile_transition_ready(%_ASM_DI)
++.Lcpuid_profile_transition_capture_restore_\@:
++	pop %_ASM_DI
++	pop %_ASM_DX
++	pop %_ASM_AX
++.Lcpuid_profile_transition_capture_skip_\@:
++.endm
++
++.macro CPUID_PROFILE_TRANSITION_COMMIT flags_off, vmx_off
++	testl $VMX_RUN_CPUID_PROFILE, (\flags_off)(%_ASM_SP)
++	jz .Lcpuid_profile_transition_commit_skip_\@
++	push %_ASM_AX
++	push %_ASM_DX
++	push %_ASM_DI
++	mov (\vmx_off+3*WORD_SIZE)(%_ASM_SP), %_ASM_DI
++	cmpl $0, VMX_cpuid_profile_transition_ready(%_ASM_DI)
++	je .Lcpuid_profile_transition_commit_restore_\@
++	movl $0, VMX_cpuid_profile_transition_ready(%_ASM_DI)
++	mov VMX_cpuid_profile_transition_elapsed(%_ASM_DI), %_ASM_AX
++	add %_ASM_AX, VMX_stat_cpuid_profile_transition_cycles(%_ASM_DI)
++	mov VMX_stat_cpuid_profile_transition_min_cycles(%_ASM_DI), %_ASM_DX
++	test %_ASM_DX, %_ASM_DX
++	jz .Lcpuid_profile_transition_set_min_\@
++	cmp %_ASM_DX, %_ASM_AX
++	jae .Lcpuid_profile_transition_min_done_\@
++.Lcpuid_profile_transition_set_min_\@:
++	mov %_ASM_AX, VMX_stat_cpuid_profile_transition_min_cycles(%_ASM_DI)
++.Lcpuid_profile_transition_min_done_\@:
++	mov VMX_stat_cpuid_profile_transition_max_cycles(%_ASM_DI), %_ASM_DX
++	cmp %_ASM_DX, %_ASM_AX
++	jbe .Lcpuid_profile_transition_max_done_\@
++	mov %_ASM_AX, VMX_stat_cpuid_profile_transition_max_cycles(%_ASM_DI)
++.Lcpuid_profile_transition_max_done_\@:
++	incq VMX_stat_cpuid_profile_transition_samples(%_ASM_DI)
++.Lcpuid_profile_transition_commit_restore_\@:
++	pop %_ASM_DI
++	pop %_ASM_DX
++	pop %_ASM_AX
++.Lcpuid_profile_transition_commit_skip_\@:
++.endm
++
++.macro CPUID_PROFILE_TRANSITION_ARM flags_off, vmx_off
++	testl $VMX_RUN_CPUID_PROFILE_SAMPLE, (\flags_off)(%_ASM_SP)
++	jz .Lcpuid_profile_transition_arm_skip_\@
++	push %_ASM_AX
++	push %_ASM_DX
++	push %_ASM_DI
++	mov (\vmx_off+3*WORD_SIZE)(%_ASM_SP), %_ASM_DI
++	movl $0, VMX_cpuid_profile_transition_ready(%_ASM_DI)
++	lfence
++	rdtsc
++	shl $32, %_ASM_DX
++	or %_ASM_DX, %_ASM_AX
++	mov %_ASM_AX, VMX_cpuid_profile_transition_tsc_start(%_ASM_DI)
++	movl $1, VMX_cpuid_profile_transition_armed(%_ASM_DI)
++	pop %_ASM_DI
++	pop %_ASM_DX
++	pop %_ASM_AX
++.Lcpuid_profile_transition_arm_skip_\@:
++.endm
++#endif
++
+ #define VCPU_RAX	__VCPU_REGS_RAX * WORD_SIZE
+ #define VCPU_RCX	__VCPU_REGS_RCX * WORD_SIZE
+ #define VCPU_RDX	__VCPU_REGS_RDX * WORD_SIZE
+@@ -180,6 +313,241 @@
+ 	UNWIND_HINT_RESTORE
+ 	ENDBR
+ 
++#ifdef CONFIG_X86_64
++	CPUID_PROFILE_TRANSITION_CAPTURE WORD_SIZE, 2*WORD_SIZE
++	/* Sample one eligible VMEXIT every 1024 exits for stage accounting. */
++	andl $~VMX_RUN_CPUID_PROFILE_SAMPLE, WORD_SIZE(%_ASM_SP)
++	testl $VMX_RUN_CPUID_PROFILE, WORD_SIZE(%_ASM_SP)
++	jz .Lcpuid_profile_unarmed
++	push %_ASM_DI
++	mov 3*WORD_SIZE(%_ASM_SP), %_ASM_DI
++	cmpl $0, VMX_cpuid_profile_divider(%_ASM_DI)
++	je .Lcpuid_profile_take_sample
++	decl VMX_cpuid_profile_divider(%_ASM_DI)
++	jnz .Lcpuid_profile_pop_di
++
++.Lcpuid_profile_take_sample:
++	movl $1024, VMX_cpuid_profile_divider(%_ASM_DI)
++	push %_ASM_AX
++	push %_ASM_DX
++	lfence
++	rdtsc
++	shl $32, %_ASM_DX
++	or %_ASM_DX, %_ASM_AX
++	mov %_ASM_AX, VMX_cpuid_profile_tsc_start(%_ASM_DI)
++	orl $VMX_RUN_CPUID_PROFILE_SAMPLE, 4*WORD_SIZE(%_ASM_SP)
++	pop %_ASM_DX
++	pop %_ASM_AX
++.Lcpuid_profile_pop_di:
++	pop %_ASM_DI
++.Lcpuid_profile_unarmed:
++
++	/*
++	 * Try the direct-mapped home slot before spilling the complete guest
++	 * register file.  CPUID overwrites RAX/RBX/RCX/RDX, so after the exit
++	 * and event state are validated those four registers are available as
++	 * scratch.  All other guest GPRs remain live until VMRESUME.
++	 */
++	testl $VMX_RUN_CPUID_INNER_EARLY, WORD_SIZE(%_ASM_SP)
++	jz .Lcpuid_inner_save_regs
++
++	/*
++	 * RBX and RDX are needed to identify and validate the exit.  Preserve
++	 * them until it is known that CPUID can be completed immediately.
++	 */
++	push %_ASM_BX
++	push %_ASM_DX
++
++	mov $0x4402, %ebx		/* VM_EXIT_REASON */
++	vmread %_ASM_BX, %_ASM_DX
++	jbe .Lcpuid_inner_early_restore
++	cmp $0x0a, %edx			/* EXIT_REASON_CPUID, no extra flags */
++	jne .Lcpuid_inner_early_restore
++	CPUID_PROFILE_TRANSITION_COMMIT 3*WORD_SIZE, 4*WORD_SIZE
++
++	mov $0x4408, %ebx		/* IDT_VECTORING_INFO_FIELD */
++	vmread %_ASM_BX, %_ASM_DX
++	jbe .Lcpuid_inner_early_restore
++	test $0x80000000, %edx
++	jnz .Lcpuid_inner_early_restore
++
++	mov $0x4824, %ebx		/* GUEST_INTERRUPTIBILITY_INFO */
++	vmread %_ASM_BX, %_ASM_DX
++	jbe .Lcpuid_inner_early_restore
++	test $0x03, %edx		/* STI or MOV SS shadow */
++	jnz .Lcpuid_inner_early_restore
++
++	mov $0x6820, %ebx		/* GUEST_RFLAGS */
++	vmread %_ASM_BX, %_ASM_DX
++	jbe .Lcpuid_inner_early_restore
++	test $0x100, %edx		/* X86_EFLAGS_TF */
++	jnz .Lcpuid_inner_early_restore
++	CPUID_PROFILE_MARK_VALIDATION(3*WORD_SIZE, 4*WORD_SIZE)
++
++	/* CPUID will replace RBX and RDX, so their input values are dead. */
++	add $2*WORD_SIZE, %_ASM_SP
++
++	/* Reuse the last exact cache entry before recomputing its hash. */
++	mov 2*WORD_SIZE(%_ASM_SP), %_ASM_DX
++	mov VMX_cpuid_fast_mru(%_ASM_DX), %_ASM_BX
++	test %_ASM_BX, %_ASM_BX
++	jz .Lcpuid_inner_early_nonindexed
++	mov VMX_CPUID_CACHE_flags(%_ASM_BX), %edx
++	test $VMX_CPUID_CACHE_valid, %edx
++	jz .Lcpuid_inner_early_nonindexed
++	cmp %eax, VMX_CPUID_CACHE_function(%_ASM_BX)
++	jne .Lcpuid_inner_early_nonindexed
++	test $VMX_CPUID_CACHE_indexed, %edx
++	jz .Lcpuid_inner_early_hit
++	cmp %ecx, VMX_CPUID_CACHE_index(%_ASM_BX)
++	je .Lcpuid_inner_early_hit
++
++.Lcpuid_inner_early_nonindexed:
++	/* First try the non-indexed direct-map slot. */
++	mov %eax, %ebx
++	imul $0x9e3779b1, %ebx, %ebx
++	shr $24, %ebx
++	and $VMX_CPUID_CACHE_mask, %ebx
++	imul $VMX_CPUID_CACHE_entry_size, %ebx, %ebx
++	mov 2*WORD_SIZE(%_ASM_SP), %_ASM_DX
++	lea VMX_cpuid_fast_cache(%_ASM_DX, %_ASM_BX), %_ASM_BX
++	mov VMX_CPUID_CACHE_flags(%_ASM_BX), %edx
++	test $VMX_CPUID_CACHE_valid, %edx
++	jz .Lcpuid_inner_early_indexed
++	test $VMX_CPUID_CACHE_indexed, %edx
++	jnz .Lcpuid_inner_early_indexed
++	cmp %eax, VMX_CPUID_CACHE_function(%_ASM_BX)
++	je .Lcpuid_inner_early_cache_hit
++
++.Lcpuid_inner_early_indexed:
++	/* Then try the exact indexed direct-map slot. */
++	mov %eax, %ebx
++	imul $0x9e3779b1, %ebx, %ebx
++	mov %ecx, %edx
++	imul $0x85ebca6b, %edx, %edx
++	xor %edx, %ebx
++	shr $24, %ebx
++	and $VMX_CPUID_CACHE_mask, %ebx
++	imul $VMX_CPUID_CACHE_entry_size, %ebx, %ebx
++	mov 2*WORD_SIZE(%_ASM_SP), %_ASM_DX
++	lea VMX_cpuid_fast_cache(%_ASM_DX, %_ASM_BX), %_ASM_BX
++	mov VMX_CPUID_CACHE_flags(%_ASM_BX), %edx
++	test $VMX_CPUID_CACHE_valid, %edx
++	jz .Lcpuid_inner_early_cache_miss
++	test $VMX_CPUID_CACHE_indexed, %edx
++	jz .Lcpuid_inner_early_cache_miss
++	cmp %eax, VMX_CPUID_CACHE_function(%_ASM_BX)
++	jne .Lcpuid_inner_early_cache_miss
++	cmp %ecx, VMX_CPUID_CACHE_index(%_ASM_BX)
++	jne .Lcpuid_inner_early_cache_miss
++
++.Lcpuid_inner_early_cache_hit:
++	mov 2*WORD_SIZE(%_ASM_SP), %_ASM_DX
++	mov %_ASM_BX, VMX_cpuid_fast_mru(%_ASM_DX)
++	jmp .Lcpuid_inner_early_hit
++
++.Lcpuid_inner_early_cache_miss:
++	/*
++	 * Tell the post-spill path that all VMCS safety checks already passed,
++	 * avoiding a second set of VMREADs for collisions and dynamic leaves.
++	 */
++	orl $VMX_RUN_CPUID_INNER_EARLY_VALIDATED, WORD_SIZE(%_ASM_SP)
++	jmp .Lcpuid_inner_save_regs
++
++.Lcpuid_inner_early_hit:
++	/*
++	 * Preserve the CPUID inputs and cache pointer until every VMCS access
++	 * succeeds.  This keeps the ordinary slow path recoverable even on an
++	 * unexpected VMREAD/VMWRITE failure.
++	 */
++	push %_ASM_AX
++	push %_ASM_CX
++	push %_ASM_BX
++	CPUID_PROFILE_MARK_LOOKUP(4*WORD_SIZE, 5*WORD_SIZE)
++
++	mov $0x440c, %eax		/* VM_EXIT_INSTRUCTION_LEN */
++	vmread %_ASM_AX, %_ASM_CX
++	jbe .Lcpuid_inner_early_hit_fail
++	mov $0x681e, %eax		/* GUEST_RIP */
++	vmread %_ASM_AX, %_ASM_DX
++	jbe .Lcpuid_inner_early_hit_fail
++
++	mov %_ASM_DX, %_ASM_BX
++	add %_ASM_CX, %_ASM_DX
++	mov %_ASM_DX, %_ASM_CX
++	xor %_ASM_BX, %_ASM_CX
++	shr $31, %_ASM_CX
++	cmp $3, %_ASM_CX
++	jne .Lcpuid_inner_early_write_rip
++	mov $0x4816, %eax		/* GUEST_CS_AR_BYTES */
++	vmread %_ASM_AX, %_ASM_CX
++	jbe .Lcpuid_inner_early_hit_fail
++	test $0x2000, %ecx		/* VMX_AR_L_MASK */
++	jnz .Lcpuid_inner_early_write_rip
++	mov %edx, %edx			/* 32-bit RIP wraps at bit 31. */
++
++.Lcpuid_inner_early_write_rip:
++	mov $0x681e, %eax
++	vmwrite %_ASM_DX, %_ASM_AX
++	jbe .Lcpuid_inner_early_hit_fail
++	CPUID_PROFILE_MARK_RIP(4*WORD_SIZE, 5*WORD_SIZE)
++
++	pop %_ASM_BX			/* Cache entry. */
++	add $2*WORD_SIZE, %_ASM_SP	/* Discard saved RCX and RAX. */
++
++	/* Complete accounting before loading the four architectural outputs. */
++	mov 2*WORD_SIZE(%_ASM_SP), %_ASM_DX
++	incq VMX_stat_exits(%_ASM_DX)
++	incq VMX_stat_cpuid_fastpath(%_ASM_DX)
++	incq VMX_stat_cpuid_inner_fastpath(%_ASM_DX)
++	mov VMX_loaded_vmcs(%_ASM_DX), %_ASM_AX
++	movb $1, LOADED_VMCS_launched(%_ASM_AX)
++
++	/* Keep the canonical array synchronized for VMRESUME failure handling. */
++	push %_ASM_DI
++	mov WORD_SIZE(%_ASM_SP), %_ASM_DI
++	mov VMX_CPUID_CACHE_eax(%_ASM_BX), %eax
++	mov %_ASM_AX, VCPU_RAX(%_ASM_DI)
++	mov VMX_CPUID_CACHE_ecx(%_ASM_BX), %ecx
++	mov %_ASM_CX, VCPU_RCX(%_ASM_DI)
++	mov VMX_CPUID_CACHE_edx(%_ASM_BX), %edx
++	mov %_ASM_DX, VCPU_RDX(%_ASM_DI)
++	mov VMX_CPUID_CACHE_ebx(%_ASM_BX), %ebx
++	mov %_ASM_BX, VCPU_RBX(%_ASM_DI)
++	pop %_ASM_DI
++
++	/* Replay timing4's guarded VM-entry buffer clearing policy. */
++	ALTERNATIVE_2 "",\
++		      __stringify(testl $VMX_RUN_CLEAR_CPU_BUFFERS_FOR_MMIO, WORD_SIZE(%_ASM_SP); \
++				  jz .Lcpuid_inner_early_skip_mmio_verw; \
++				  VERW; \
++				  .Lcpuid_inner_early_skip_mmio_verw:), \
++		      X86_FEATURE_CLEAR_CPU_BUF_VM_MMIO, \
++		      __stringify(testl $VMX_RUN_CPUID_INNER_SKIP_RFDS_VERW, WORD_SIZE(%_ASM_SP); \
++				  jnz .Lcpuid_inner_early_skip_rfds_verw; \
++				  VERW; \
++				  .Lcpuid_inner_early_skip_rfds_verw:), \
++			      X86_FEATURE_CLEAR_CPU_BUF_VM
++	CPUID_PROFILE_MARK_RESUME(WORD_SIZE, 2*WORD_SIZE)
++	CPUID_PROFILE_COMMIT WORD_SIZE, 2*WORD_SIZE
++	CPUID_PROFILE_TRANSITION_ARM WORD_SIZE, 2*WORD_SIZE
++	jmp .Lvmresume
++
++.Lcpuid_inner_early_hit_fail:
++	add $WORD_SIZE, %_ASM_SP	/* Discard the cache entry. */
++	pop %_ASM_CX
++	pop %_ASM_AX
++	orl $VMX_RUN_CPUID_INNER_EARLY_VALIDATED, WORD_SIZE(%_ASM_SP)
++	jmp .Lcpuid_inner_save_regs
++
++.Lcpuid_inner_early_restore:
++	pop %_ASM_DX
++	pop %_ASM_BX
++	orl $VMX_RUN_CPUID_INNER_EARLY_REJECTED, WORD_SIZE(%_ASM_SP)
++
++.Lcpuid_inner_save_regs:
++#endif
++
+ 	/* Temporarily save guest's RAX. */
+ 	push %_ASM_AX
+ 
+@@ -205,6 +573,196 @@
+ 	mov %r15, VCPU_R15(%_ASM_AX)
+ #endif
+ 
++#ifdef CONFIG_X86_64
++	/*
++	 * Complete immutable CPUID leaves without returning to the C run loop.
++	 * C enables this only when debug, PMU, tracing, nested state, and active
++	 * entry mitigations permit an immediate re-entry.
++	 */
++	testl $VMX_RUN_CPUID_INNER_EARLY_REJECTED, WORD_SIZE(%_ASM_SP)
++	jnz .Lcpuid_inner_early_rejected_saved
++	testl $VMX_RUN_CPUID_INNER_EARLY_VALIDATED, WORD_SIZE(%_ASM_SP)
++	jnz .Lcpuid_inner_early_validated_saved
++
++	testl $VMX_RUN_CPUID_INNER_FASTPATH, WORD_SIZE(%_ASM_SP)
++	jz .Lcpuid_inner_slowpath
++
++	mov $0x4402, %esi		/* VM_EXIT_REASON */
++	vmread %_ASM_SI, %_ASM_DX
++	jbe .Lcpuid_inner_slowpath
++	cmp $0x0a, %edx			/* EXIT_REASON_CPUID, no extra flags */
++	jne .Lcpuid_inner_slowpath
++	CPUID_PROFILE_TRANSITION_COMMIT WORD_SIZE, 2*WORD_SIZE
++
++	mov $0x4408, %esi		/* IDT_VECTORING_INFO_FIELD */
++	vmread %_ASM_SI, %_ASM_DX
++	jbe .Lcpuid_inner_slowpath
++	test $0x80000000, %edx
++	jnz .Lcpuid_inner_slowpath
++
++	mov $0x4824, %esi		/* GUEST_INTERRUPTIBILITY_INFO */
++	vmread %_ASM_SI, %_ASM_DX
++	jbe .Lcpuid_inner_slowpath
++	test $0x03, %edx		/* STI or MOV SS shadow */
++	jnz .Lcpuid_inner_slowpath
++
++	mov $0x6820, %esi		/* GUEST_RFLAGS */
++	vmread %_ASM_SI, %_ASM_DX
++	jbe .Lcpuid_inner_slowpath
++	test $0x100, %edx		/* X86_EFLAGS_TF */
++	jnz .Lcpuid_inner_slowpath
++
++.Lcpuid_inner_lookup:
++	CPUID_PROFILE_MARK_VALIDATION(WORD_SIZE, 2*WORD_SIZE)
++	mov %_ASM_AX, %_ASM_DI		/* &vcpu->arch.regs */
++	mov 2*WORD_SIZE(%_ASM_SP), %_ASM_BX	/* struct vcpu_vmx * */
++	mov VCPU_RAX(%_ASM_DI), %r8d	/* function */
++	mov VCPU_RCX(%_ASM_DI), %r9d	/* input index */
++	xor %r10d, %r10d		/* First try a non-indexed entry. */
++
++.Lcpuid_inner_hash:
++	mov %r8d, %edx
++	imul $0x9e3779b1, %edx, %edx
++	test %r10d, %r10d
++	jz .Lcpuid_inner_hash_ready
++	mov %r9d, %ecx
++	imul $0x85ebca6b, %ecx, %ecx
++	xor %ecx, %edx
++
++.Lcpuid_inner_hash_ready:
++	/* Use high product bits; low CPUID bytes are heavily clustered. */
++	shr $24, %edx
++	/* The cache has 256 slots, so the high byte is the final bucket. */
++	and $VMX_CPUID_CACHE_mask, %edx
++	mov %edx, %r11d
++	mov $VMX_CPUID_CACHE_probes, %ebp
++
++.Lcpuid_inner_probe:
++	mov %r11d, %edx
++	and $VMX_CPUID_CACHE_mask, %edx
++	imul $VMX_CPUID_CACHE_entry_size, %edx, %edx
++	lea VMX_cpuid_fast_cache(%_ASM_BX, %_ASM_DX), %_ASM_SI
++	mov VMX_CPUID_CACHE_flags(%_ASM_SI), %ecx
++	test $VMX_CPUID_CACHE_valid, %ecx
++	jz .Lcpuid_inner_next_mode
++	and $VMX_CPUID_CACHE_indexed, %ecx
++	cmp %r10d, %ecx
++	jne .Lcpuid_inner_next_slot
++	cmp %r8d, VMX_CPUID_CACHE_function(%_ASM_SI)
++	jne .Lcpuid_inner_next_slot
++	test %r10d, %r10d
++	jz .Lcpuid_inner_hit
++	cmp %r9d, VMX_CPUID_CACHE_index(%_ASM_SI)
++	je .Lcpuid_inner_hit
++
++.Lcpuid_inner_next_slot:
++	inc %r11d
++	dec %ebp
++	jnz .Lcpuid_inner_probe
++
++.Lcpuid_inner_next_mode:
++	test %r10d, %r10d
++	jnz .Lcpuid_inner_cache_miss
++	mov $VMX_CPUID_CACHE_indexed, %r10d
++	jmp .Lcpuid_inner_hash
++
++.Lcpuid_inner_cache_miss:
++	incq VMX_stat_cpuid_inner_cache_miss(%_ASM_BX)
++	jmp .Lcpuid_inner_slowpath
++
++.Lcpuid_inner_hit:
++	mov %_ASM_SI, %r12		/* Preserve the cache entry. */
++	mov %r12, VMX_cpuid_fast_mru(%_ASM_BX)
++	CPUID_PROFILE_MARK_LOOKUP(WORD_SIZE, 2*WORD_SIZE)
++	mov $0x440c, %esi		/* VM_EXIT_INSTRUCTION_LEN */
++	vmread %_ASM_SI, %_ASM_CX
++	jbe .Lcpuid_inner_slowpath
++	mov $0x681e, %esi		/* GUEST_RIP */
++	vmread %_ASM_SI, %_ASM_DX
++	jbe .Lcpuid_inner_slowpath
++
++	mov %_ASM_DX, %r11
++	add %_ASM_CX, %_ASM_DX
++	mov %_ASM_DX, %_ASM_CX
++	xor %r11, %_ASM_CX
++	shr $31, %_ASM_CX
++	cmp $3, %_ASM_CX
++	jne .Lcpuid_inner_write_rip
++	mov $0x4816, %esi		/* GUEST_CS_AR_BYTES */
++	vmread %_ASM_SI, %_ASM_CX
++	jbe .Lcpuid_inner_slowpath
++	test $0x2000, %ecx		/* VMX_AR_L_MASK */
++	jnz .Lcpuid_inner_write_rip
++	mov %edx, %edx			/* 32-bit RIP wraps at bit 31. */
++
++.Lcpuid_inner_write_rip:
++	mov $0x681e, %esi
++	vmwrite %_ASM_DX, %_ASM_SI
++	jbe .Lcpuid_inner_slowpath
++	CPUID_PROFILE_MARK_RIP(WORD_SIZE, 2*WORD_SIZE)
++
++	/* CPUID writes zero-extended 32-bit values to all four outputs. */
++	mov VMX_CPUID_CACHE_eax(%r12), %edx
++	mov %_ASM_DX, VCPU_RAX(%_ASM_DI)
++	mov VMX_CPUID_CACHE_ebx(%r12), %edx
++	mov %_ASM_DX, VCPU_RBX(%_ASM_DI)
++	mov VMX_CPUID_CACHE_ecx(%r12), %edx
++	mov %_ASM_DX, VCPU_RCX(%_ASM_DI)
++	mov VMX_CPUID_CACHE_edx(%r12), %edx
++	mov %_ASM_DX, VCPU_RDX(%_ASM_DI)
++
++	incq VMX_stat_exits(%_ASM_BX)
++	incq VMX_stat_cpuid_fastpath(%_ASM_BX)
++	incq VMX_stat_cpuid_inner_fastpath(%_ASM_BX)
++	mov VMX_loaded_vmcs(%_ASM_BX), %_ASM_DX
++	movb $1, LOADED_VMCS_launched(%_ASM_DX)
++
++	/* Reload the complete guest GPR set and resume the launched VMCS. */
++	mov VCPU_R8 (%_ASM_DI), %r8
++	mov VCPU_R9 (%_ASM_DI), %r9
++	mov VCPU_R10(%_ASM_DI), %r10
++	mov VCPU_R11(%_ASM_DI), %r11
++	mov VCPU_R12(%_ASM_DI), %r12
++	mov VCPU_R13(%_ASM_DI), %r13
++	mov VCPU_R14(%_ASM_DI), %r14
++	mov VCPU_R15(%_ASM_DI), %r15
++	mov VCPU_RAX(%_ASM_DI), %_ASM_AX
++	mov VCPU_RCX(%_ASM_DI), %_ASM_CX
++	mov VCPU_RDX(%_ASM_DI), %_ASM_DX
++	mov VCPU_RBX(%_ASM_DI), %_ASM_BX
++	mov VCPU_RBP(%_ASM_DI), %_ASM_BP
++	mov VCPU_RSI(%_ASM_DI), %_ASM_SI
++	mov VCPU_RDI(%_ASM_DI), %_ASM_DI
++
++	/* Replay the standard VM-entry buffer clearing before direct re-entry. */
++	ALTERNATIVE_2 "",\
++		      __stringify(testl $VMX_RUN_CLEAR_CPU_BUFFERS_FOR_MMIO, WORD_SIZE(%_ASM_SP); \
++				  jz .Lcpuid_inner_skip_mmio_verw; \
++				  VERW; \
++				  .Lcpuid_inner_skip_mmio_verw:), \
++		      X86_FEATURE_CLEAR_CPU_BUF_VM_MMIO, \
++			      __stringify(testl $VMX_RUN_CPUID_INNER_SKIP_RFDS_VERW, WORD_SIZE(%_ASM_SP); \
++				  jnz .Lcpuid_inner_skip_rfds_verw; \
++				  VERW; \
++				  .Lcpuid_inner_skip_rfds_verw:), \
++			      X86_FEATURE_CLEAR_CPU_BUF_VM
++	CPUID_PROFILE_MARK_RESUME(WORD_SIZE, 2*WORD_SIZE)
++	CPUID_PROFILE_COMMIT WORD_SIZE, 2*WORD_SIZE
++	CPUID_PROFILE_TRANSITION_ARM WORD_SIZE, 2*WORD_SIZE
++	jmp .Lvmresume
++
++.Lcpuid_inner_early_validated_saved:
++	andl $~(VMX_RUN_CPUID_INNER_EARLY_VALIDATED | \
++		 VMX_RUN_CPUID_INNER_EARLY_REJECTED), WORD_SIZE(%_ASM_SP)
++	jmp .Lcpuid_inner_lookup
++
++.Lcpuid_inner_early_rejected_saved:
++	andl $~(VMX_RUN_CPUID_INNER_EARLY_VALIDATED | \
++		 VMX_RUN_CPUID_INNER_EARLY_REJECTED), WORD_SIZE(%_ASM_SP)
++
++.Lcpuid_inner_slowpath:
++#endif
++
+ 	/* Clear return value to indicate VM-Exit (as opposed to VM-Fail). */
+ 	xor %ebx, %ebx
+ 
+diff -Naur old/arch/x86/kvm/vmx/vmx.c new/arch/x86/kvm/vmx/vmx.c
+--- a/arch/x86/kvm/vmx/vmx.c	2026-09-19 14:03:02.728638799 +0800
++++ b/arch/x86/kvm/vmx/vmx.c	2026-09-19 14:05:26.493236100 +0800
+@@ -40,6 +40,7 @@
+ #include <asm/fred.h>
+ #include <asm/idtentry.h>
+ #include <asm/io.h>
++#include <asm/intel-family.h>
+ #include <asm/irq_remapping.h>
+ #include <asm/reboot.h>
+ #include <asm/perf_event.h>
+@@ -117,6 +118,46 @@
+ static bool __read_mostly fasteoi = 1;
+ module_param(fasteoi, bool, 0444);
+ 
++static bool __read_mostly fast_cpuid = true;
++module_param(fast_cpuid, bool, 0644);
++MODULE_PARM_DESC(fast_cpuid,
++		 "Handle eligible CPUID exits in the standard KVM re-entry loop");
++
++static bool __read_mostly fast_cpuid_direct = true;
++module_param(fast_cpuid_direct, bool, 0644);
++MODULE_PARM_DESC(fast_cpuid_direct,
++		 "Use VMX-local completion for guarded CPUID fastpath exits");
++
++static bool __read_mostly fast_cpuid_inner = true;
++module_param(fast_cpuid_inner, bool, 0644);
++MODULE_PARM_DESC(fast_cpuid_inner,
++		 "Re-enter directly from VMX assembly for cached static CPUID leaves");
++
++static bool __read_mostly fast_cpuid_inner_debug;
++module_param(fast_cpuid_inner_debug, bool, 0644);
++MODULE_PARM_DESC(fast_cpuid_inner_debug,
++		 "Log rate-limited changes to CPUID inner-fastpath blocker bits");
++
++static bool __read_mostly fast_cpuid_inner_skip_rfds_pcore;
++module_param(fast_cpuid_inner_skip_rfds_pcore, bool, 0644);
++MODULE_PARM_DESC(fast_cpuid_inner_skip_rfds_pcore,
++		 "Skip RFDS-only VERW on Intel performance cores in the CPUID inner fastpath");
++
++static bool __read_mostly fast_cpuid_inner_early;
++module_param(fast_cpuid_inner_early, bool, 0644);
++MODULE_PARM_DESC(fast_cpuid_inner_early,
++		 "Try a direct-map CPUID cache before saving the complete guest GPR set");
++
++static bool __read_mostly fast_cpuid_inner_profile;
++module_param(fast_cpuid_inner_profile, bool, 0644);
++MODULE_PARM_DESC(fast_cpuid_inner_profile,
++		 "Sample CPUID inner-fastpath cycle buckets (diagnostic only)");
++
++#define VMX_CPUID_PROFILE_STATE_PERF	BIT_ULL(0)
++#define VMX_CPUID_PROFILE_STATE_PAT	BIT_ULL(1)
++#define VMX_CPUID_PROFILE_STATE_EFER	BIT_ULL(2)
++#define VMX_CPUID_PROFILE_STATE_CET	BIT_ULL(3)
++
+ module_param(enable_apicv, bool, 0444);
+ module_param(enable_ipiv, bool, 0444);
+ 
+@@ -2149,9 +2190,21 @@
+ 			return 1;
+ 		msr_info->data = vcpu->arch.mcg_ext_ctl;
+ 		break;
+-	case MSR_IA32_FEAT_CTL:
+-		msr_info->data = vmx->msr_ia32_feature_control;
++	case MSR_IA32_FEAT_CTL: {
++		u64 data = FEAT_CTL_LOCKED;
++
++		if (guest_cpu_cap_has(vcpu, X86_FEATURE_VMX))
++			data |= FEAT_CTL_VMX_ENABLED_INSIDE_SMX |
++				FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX;
++		if (guest_cpu_cap_has(vcpu, X86_FEATURE_SGX))
++			data |= FEAT_CTL_SGX_ENABLED;
++		if (guest_cpu_cap_has(vcpu, X86_FEATURE_SGX_LC))
++			data |= FEAT_CTL_SGX_LC_ENABLED;
++		if (vmx->msr_ia32_feature_control & FEAT_CTL_LMCE_ENABLED)
++			data |= FEAT_CTL_LMCE_ENABLED;
++		msr_info->data = data;
+ 		break;
++	}
+ 	case MSR_IA32_SGXLEPUBKEYHASH0 ... MSR_IA32_SGXLEPUBKEYHASH3:
+ 		if (!msr_info->host_initiated &&
+ 		    !guest_cpu_cap_has(vcpu, X86_FEATURE_SGX_LC))
+@@ -2260,7 +2313,7 @@
+ 
+ u64 vmx_get_supported_debugctl(struct kvm_vcpu *vcpu, bool host_initiated)
+ {
+-	u64 debugctl = 0;
++	u64 debugctl = DEBUGCTLMSR_BTF;
+ 
+ 	if (boot_cpu_has(X86_FEATURE_BUS_LOCK_DETECT) &&
+ 	    (host_initiated || guest_cpu_cap_has(vcpu, X86_FEATURE_BUS_LOCK_DETECT)))
+@@ -2593,6 +2646,8 @@
+ 	/* FB_CLEAR may have changed, also update the FB_CLEAR_DIS behavior */
+ 	if (msr_index == MSR_IA32_ARCH_CAPABILITIES)
+ 		vmx_update_fb_clear_dis(vcpu, vmx);
++	if (!ret)
++		vcpu->stat.cpuid_dynamic_generation++;
+ 
+ 	return ret;
+ }
+@@ -4980,6 +5035,14 @@
+ 	if (kvm_check_has_quirk(vcpu->kvm, KVM_X86_QUIRK_STUFF_FEATURE_MSRS))
+-		vcpu->arch.microcode_version = 0x100000000ULL;
++	{
++		u64 host_ucode;
++
++		if (rdmsrq_safe(MSR_IA32_UCODE_REV, &host_ucode))
++			vcpu->arch.microcode_version = 0x100000000ULL;
++		else
++			vcpu->arch.microcode_version = host_ucode;
++	}
+ 	vmx->msr_ia32_feature_control_valid_bits = FEAT_CTL_LOCKED;
++	vmx->msr_ia32_feature_control = FEAT_CTL_LOCKED;
+ 
+ 	/*
+ 	 * Enforce invariant: pi_desc.nv is always either POSTED_INTR_VECTOR
+@@ -6295,6 +6358,15 @@
+ 				     vmx_get_msr_imm_reg(vcpu));
+ }
+ 
++static int handle_vmcall(struct kvm_vcpu *vcpu)
++{
++	/* A hidden hypervisor must behave like bare-metal Intel. */
++	if (!guest_cpu_cap_has(vcpu, X86_FEATURE_HYPERVISOR))
++		return kvm_handle_invalid_op(vcpu);
++
++	return kvm_emulate_hypercall(vcpu);
++}
++
+ /*
+  * The exit handlers return 1 if the exit was handled fully and guest execution
+  * may resume.  Otherwise they set the kvm_run parameter to indicate what needs
+@@ -6316,7 +6388,7 @@
+ 	[EXIT_REASON_INVD]		      = kvm_emulate_invd,
+ 	[EXIT_REASON_INVLPG]		      = handle_invlpg,
+ 	[EXIT_REASON_RDPMC]                   = kvm_emulate_rdpmc,
+-	[EXIT_REASON_VMCALL]                  = kvm_emulate_hypercall,
++	[EXIT_REASON_VMCALL]                  = handle_vmcall,
+ 	[EXIT_REASON_VMCLEAR]		      = handle_vmx_instruction,
+ 	[EXIT_REASON_VMLAUNCH]		      = handle_vmx_instruction,
+ 	[EXIT_REASON_VMPTRLD]		      = handle_vmx_instruction,
+@@ -7434,6 +7506,82 @@
+ 	barrier_nospec();
+ }
+ 
++static int vmx_emulate_cpuid_fast(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	u32 eax = kvm_rax_read(vcpu), ecx = kvm_rcx_read(vcpu);
++	u32 ebx, edx;
++
++	/* Leaf 0 is immutable after KVM_SET_CPUID2 and is a common hot leaf. */
++	if (eax == 0 && likely(vmx->cpuid0_cache.valid)) {
++		eax = vmx->cpuid0_cache.eax;
++		ebx = vmx->cpuid0_cache.ebx;
++		edx = vmx->cpuid0_cache.edx;
++		kvm_trace_cpuid(0, ecx, eax, ebx, vmx->cpuid0_cache.ecx, edx,
++				true, false);
++		ecx = vmx->cpuid0_cache.ecx;
++	} else {
++		/* Keep the live KVM model and all runtime leaf fixups. */
++		kvm_cpuid(vcpu, &eax, &ebx, &ecx, &edx, false);
++	}
++	kvm_rax_write(vcpu, eax);
++	kvm_rbx_write(vcpu, ebx);
++	kvm_rcx_write(vcpu, ecx);
++	kvm_rdx_write(vcpu, edx);
++
++	/*
++	 * The caller excludes TF, userspace debugging, SMM, CPUID faulting,
++	 * and nested guests. Avoid dispatching back through x86.c to VMX,
++	 * but retain VMCS instruction length, RIP wrap, interrupt shadow,
++	 * and the normal PMU instruction-retirement notification.
++	 */
++	if (!vmx_skip_emulated_instruction(vcpu))
++		return 0;
++	kvm_pmu_instruction_retired(vcpu);
++	return 1;
++}
++
++static fastpath_t handle_fastpath_cpuid(struct kvm_vcpu *vcpu)
++{
++	if (!READ_ONCE(fast_cpuid))
++		return EXIT_FASTPATH_NONE;
++
++	/* Keep exceptional exits and instruction accounting on the slow path. */
++	if (vmx_get_exit_reason(vcpu).full != EXIT_REASON_CPUID ||
++	    to_vmx(vcpu)->idt_vectoring_info & VECTORING_INFO_VALID_MASK ||
++	    is_smm(vcpu) || vcpu->guest_debug || cpuid_fault_enabled(vcpu) ||
++	    vcpu->arch.cpuid_dynamic_bits_dirty ||
++	    !kvm_pmu_is_fastpath_emulation_allowed(vcpu))
++		goto slow_path;
++
++	/*
++	 * Guest TF is independent of KVM_GUESTDBG_* controls. Debug registers
++	 * written without exits are synchronized only after the re-entry loop;
++	 * do not synthesize #DB from a stale DR0-DR3/DR7 snapshot here.
++	 */
++	if ((vcpu->arch.switch_db_regs & KVM_DEBUGREG_WONT_EXIT) ||
++	    (kvm_get_rflags(vcpu) & X86_EFLAGS_TF))
++		goto slow_path;
++
++#ifdef CONFIG_KVM_XEN
++	/* Xen clock leaves can access guest memory without an irq-off SRCU lock. */
++	if (vcpu->arch.xen.cpuid.base)
++		goto slow_path;
++#endif
++
++	/* Use KVM's live CPUID model and normal RIP/#DB/interrupt-shadow logic. */
++	if (!(READ_ONCE(fast_cpuid_direct) ? vmx_emulate_cpuid_fast(vcpu) :
++					  kvm_emulate_cpuid(vcpu)))
++		return EXIT_FASTPATH_EXIT_USERSPACE;
++
++	++vcpu->stat.cpuid_fastpath;
++	return EXIT_FASTPATH_REENTER_GUEST;
++
++slow_path:
++	++vcpu->stat.cpuid_fastpath_fallback;
++	return EXIT_FASTPATH_NONE;
++}
++
+ static fastpath_t vmx_exit_handlers_fastpath(struct kvm_vcpu *vcpu,
+ 					     bool force_immediate_exit)
+ {
+@@ -7446,6 +7594,8 @@
+ 		return EXIT_FASTPATH_NONE;
+ 
+ 	switch (vmx_get_exit_reason(vcpu).basic) {
++	case EXIT_REASON_CPUID:
++		return handle_fastpath_cpuid(vcpu);
+ 	case EXIT_REASON_MSR_WRITE:
+ 		return handle_fastpath_wrmsr(vcpu);
+ 	case EXIT_REASON_MSR_WRITE_IMM:
+@@ -7462,6 +7612,207 @@
+ 	}
+ }
+ 
++static bool vmx_cpuid_fast_cacheable_function(struct kvm_vcpu *vcpu,
++					       u32 function);
++
++static void vmx_cpuid_fast_cache_value(struct kvm_vcpu *vcpu,
++					struct kvm_cpuid_entry2 *entry,
++					u32 *eax, u32 *ebx, u32 *ecx, u32 *edx)
++{
++	*eax = entry->function;
++	*ecx = (entry->flags & KVM_CPUID_FLAG_SIGNIFCANT_INDEX) ?
++		entry->index : 0;
++	kvm_cpuid(vcpu, eax, ebx, ecx, edx, false);
++}
++
++static void vmx_cpuid_fast_cache_query_value(struct kvm_vcpu *vcpu,
++						      u32 function, u32 index,
++						      u32 *eax, u32 *ebx, u32 *ecx,
++						      u32 *edx)
++{
++	*eax = function;
++	*ecx = index;
++	kvm_cpuid(vcpu, eax, ebx, ecx, edx, false);
++}
++
++struct vmx_cpuid_fast_cache_query {
++	u32 function;
++	u32 index;
++	bool indexed;
++};
++
++/* Common architectural probes which may be synthesized by kvm_cpuid(). */
++static const struct vmx_cpuid_fast_cache_query vmx_cpuid_fast_cache_queries[] = {
++	{ 0x0000000b, 0, true },
++	{ 0x0000000b, 1, true },
++	{ 0x0000000b, 0xff, true },
++	{ 0x0000001f, 0, true },
++	{ 0x0000001f, 1, true },
++	{ 0x40000000, 0, false },
++	{ 0x40000100, 0, false },
++	{ 0x80000000, 0, false },
++	{ 0xc0000000, 0, false },
++	{ 0xffffffff, 0, false },
++};
++
++static void vmx_cpuid_fast_cache_synthetic(struct vcpu_vmx *vmx)
++{
++	struct kvm_vcpu *vcpu = &vmx->vcpu;
++	struct vmx_cpuid_fast_cache_entry *slot;
++	const struct vmx_cpuid_fast_cache_query *query;
++	u32 hash, flags, value_eax, value_ebx, value_ecx, value_edx;
++	int i, probe;
++
++	for (i = 0; i < ARRAY_SIZE(vmx_cpuid_fast_cache_queries); i++) {
++		query = &vmx_cpuid_fast_cache_queries[i];
++		flags = VMX_CPUID_FAST_CACHE_VALID;
++		if (query->indexed)
++			flags |= VMX_CPUID_FAST_CACHE_INDEXED;
++		hash = ((query->function * 0x9e3779b1U) ^
++			(query->index * 0x85ebca6bU)) >> 24;
++		for (probe = 0; probe < VMX_CPUID_FAST_CACHE_PROBES; probe++) {
++			slot = &vmx->cpuid_fast_cache[
++				(hash + probe) & (VMX_CPUID_FAST_CACHE_SIZE - 1)];
++			if (!(slot->flags & VMX_CPUID_FAST_CACHE_VALID))
++				break;
++			if (slot->function == query->function &&
++			    slot->index == query->index &&
++			    (slot->flags & VMX_CPUID_FAST_CACHE_INDEXED) ==
++			    (flags & VMX_CPUID_FAST_CACHE_INDEXED))
++				goto next_synthetic_query;
++		}
++		if (probe == VMX_CPUID_FAST_CACHE_PROBES)
++			continue;
++
++		vmx_cpuid_fast_cache_query_value(vcpu, query->function,
++						 query->index, &value_eax, &value_ebx,
++						 &value_ecx, &value_edx);
++		slot->function = query->function;
++		slot->index = query->index;
++		slot->eax = value_eax;
++		slot->ebx = value_ebx;
++		slot->ecx = value_ecx;
++		slot->edx = value_edx;
++		slot->flags = flags;
++next_synthetic_query:
++		continue;
++	}
++}
++
++static void vmx_cpuid_fast_cache_refresh(struct vcpu_vmx *vmx)
++{
++	struct kvm_vcpu *vcpu = &vmx->vcpu;
++	struct kvm_cpuid_entry2 *entry;
++	struct vmx_cpuid_fast_cache_entry *slot;
++	u32 function, index, hash, flags;
++	u32 value_eax, value_ebx, value_ecx, value_edx;
++	int i, probe;
++
++	vmx->cpuid_fast_mru = NULL;
++	memset(vmx->cpuid_fast_cache, 0, sizeof(vmx->cpuid_fast_cache));
++	for (i = 0; i < vcpu->arch.cpuid_nent; i++) {
++		entry = &vcpu->arch.cpuid_entries[i];
++		function = entry->function;
++		if (!vmx_cpuid_fast_cacheable_function(vcpu, function))
++			continue;
++		flags = VMX_CPUID_FAST_CACHE_VALID;
++		if (entry->flags & KVM_CPUID_FLAG_SIGNIFCANT_INDEX) {
++			flags |= VMX_CPUID_FAST_CACHE_INDEXED;
++			index = entry->index;
++		} else {
++			index = 0;
++		}
++		hash = ((function * 0x9e3779b1U) ^
++			(index * 0x85ebca6bU)) >> 24;
++		for (probe = 0; probe < VMX_CPUID_FAST_CACHE_PROBES; probe++) {
++			slot = &vmx->cpuid_fast_cache[
++				(hash + probe) & (VMX_CPUID_FAST_CACHE_SIZE - 1)];
++			if (!(slot->flags & VMX_CPUID_FAST_CACHE_VALID))
++				break;
++			if (slot->function == function && slot->index == index &&
++			    (slot->flags & VMX_CPUID_FAST_CACHE_INDEXED) ==
++			    (flags & VMX_CPUID_FAST_CACHE_INDEXED))
++				goto next_dynamic_entry;
++		}
++		if (probe == VMX_CPUID_FAST_CACHE_PROBES)
++			continue;
++		slot->function = function;
++		slot->index = index;
++		vmx_cpuid_fast_cache_value(vcpu, entry, &value_eax, &value_ebx,
++						    &value_ecx, &value_edx);
++		slot->eax = value_eax;
++		slot->ebx = value_ebx;
++		slot->ecx = value_ecx;
++		slot->edx = value_edx;
++		slot->flags = flags;
++next_dynamic_entry:
++		continue;
++	}
++	vmx_cpuid_fast_cache_synthetic(vmx);
++	vmx->cpuid_fast_cache_generation = vcpu->stat.cpuid_dynamic_generation;
++}
++
++static u64 vmx_cpuid_inner_fastpath_blockers(struct vcpu_vmx *vmx,
++					     bool force_immediate_exit)
++{
++	struct kvm_vcpu *vcpu = &vmx->vcpu;
++	struct kvm_pmu *pmu = vcpu_to_pmu(vcpu);
++	u64 blockers = 0;
++
++	if (!IS_ENABLED(CONFIG_X86_64) || !READ_ONCE(fast_cpuid) ||
++	    !READ_ONCE(fast_cpuid_direct) || !READ_ONCE(fast_cpuid_inner))
++		blockers |= VMX_CPUID_INNER_BLOCK_DISABLED;
++	if (force_immediate_exit)
++		blockers |= VMX_CPUID_INNER_BLOCK_IMMEDIATE;
++	if (trace_kvm_entry_enabled() || trace_kvm_exit_enabled() ||
++	    kvm_cpuid_trace_enabled())
++		blockers |= VMX_CPUID_INNER_BLOCK_TRACE;
++
++#ifdef CONFIG_CPU_MITIGATIONS
++	if (static_branch_unlikely(&vmx_l1d_should_flush))
++		blockers |= VMX_CPUID_INNER_BLOCK_L1D;
++#endif
++
++	if (is_guest_mode(vcpu) || is_smm(vcpu))
++		blockers |= VMX_CPUID_INNER_BLOCK_MODE;
++	if (vcpu->guest_debug ||
++	    vcpu->arch.switch_db_regs & KVM_DEBUGREG_WONT_EXIT)
++		blockers |= VMX_CPUID_INNER_BLOCK_DEBUG;
++	if (cpuid_fault_enabled(vcpu))
++		blockers |= VMX_CPUID_INNER_BLOCK_FAULT;
++	if (vcpu->arch.cpuid_dynamic_bits_dirty)
++		blockers |= VMX_CPUID_INNER_BLOCK_DYNAMIC;
++	if (!bitmap_empty(pmu->pmc_counting_instructions, X86_PMC_IDX_MAX))
++		blockers |= VMX_CPUID_INNER_BLOCK_PMU;
++
++#ifdef CONFIG_KVM_XEN
++	if (vcpu->arch.xen.cpuid.base)
++		blockers |= VMX_CPUID_INNER_BLOCK_XEN;
++#endif
++
++	return blockers;
++}
++
++static bool vmx_cpuid_inner_can_skip_rfds_verw(void)
++{
++	/*
++	 * RFDS affects the Atom/E-core side of Intel hybrid processors, but its
++	 * architectural enumeration is package-wide.  Restrict this experiment
++	 * to a P-core and reject every other vulnerability which can require the
++	 * same VERW-before-VM-entry sequence.
++	 */
++	if (!READ_ONCE(fast_cpuid_inner_skip_rfds_pcore) ||
++	    !cpu_feature_enabled(X86_FEATURE_CLEAR_CPU_BUF_VM) ||
++	    !boot_cpu_has_bug(X86_BUG_RFDS) ||
++	    boot_cpu_has_bug(X86_BUG_MDS) ||
++	    boot_cpu_has_bug(X86_BUG_TAA) ||
++	    boot_cpu_has_bug(X86_BUG_MMIO_STALE_DATA))
++		return false;
++
++	return cpu_data(raw_smp_processor_id()).topo.intel_type ==
++	       INTEL_CPU_TYPE_CORE;
++}
++
+ noinstr void vmx_handle_nmi(struct kvm_vcpu *vcpu)
+ {
+ 	if ((u16)vmx_get_exit_reason(vcpu).basic != EXIT_REASON_EXCEPTION_NMI ||
+@@ -7512,11 +7863,124 @@
+ 	guest_state_exit_irqoff();
+ }
+ 
++static void vmx_cpuid_profile_state_audit(struct vcpu_vmx *vmx)
++{
++	struct kvm_vcpu_stat *stat = &vmx->vcpu.stat;
++	u32 vmexit_ctl = vmcs_read32(VM_EXIT_CONTROLS);
++	u32 vmentry_ctl = vmcs_read32(VM_ENTRY_CONTROLS);
++	u64 active_mask = 0;
++	u64 equal_mask = 0;
++	u64 guest, host;
++
++	stat->cpuid_profile_vm_exit_msr_store_count =
++		vmcs_read32(VM_EXIT_MSR_STORE_COUNT);
++	stat->cpuid_profile_vm_exit_msr_load_count =
++		vmcs_read32(VM_EXIT_MSR_LOAD_COUNT);
++	stat->cpuid_profile_vm_entry_msr_load_count =
++		vmcs_read32(VM_ENTRY_MSR_LOAD_COUNT);
++	stat->cpuid_profile_vm_exit_controls = vmexit_ctl;
++	stat->cpuid_profile_vm_entry_controls = vmentry_ctl;
++	stat->cpuid_profile_primary_exec_controls =
++		vmcs_read32(CPU_BASED_VM_EXEC_CONTROL);
++	stat->cpuid_profile_secondary_exec_controls =
++		cpu_has_secondary_exec_ctrls() ?
++		vmcs_read32(SECONDARY_VM_EXEC_CONTROL) : 0;
++
++	stat->cpuid_profile_state_guest_perf_global_ctrl = 0;
++	stat->cpuid_profile_state_host_perf_global_ctrl = 0;
++	stat->cpuid_profile_state_guest_pat = 0;
++	stat->cpuid_profile_state_host_pat = 0;
++	stat->cpuid_profile_state_guest_efer = 0;
++	stat->cpuid_profile_state_host_efer = 0;
++	stat->cpuid_profile_state_guest_s_cet = 0;
++	stat->cpuid_profile_state_host_s_cet = 0;
++	stat->cpuid_profile_state_guest_ssp = 0;
++	stat->cpuid_profile_state_host_ssp = 0;
++	stat->cpuid_profile_state_guest_intr_ssp_table = 0;
++	stat->cpuid_profile_state_host_intr_ssp_table = 0;
++
++	if ((vmentry_ctl & VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL) ||
++	    (vmexit_ctl & (VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL |
++			   VM_EXIT_SAVE_IA32_PERF_GLOBAL_CTRL))) {
++		active_mask |= VMX_CPUID_PROFILE_STATE_PERF;
++		stat->cpuid_profile_state_perf_active_samples++;
++		guest = vmcs_read64(GUEST_IA32_PERF_GLOBAL_CTRL);
++		host = vmcs_read64(HOST_IA32_PERF_GLOBAL_CTRL);
++		stat->cpuid_profile_state_guest_perf_global_ctrl = guest;
++		stat->cpuid_profile_state_host_perf_global_ctrl = host;
++		if (guest == host) {
++			equal_mask |= VMX_CPUID_PROFILE_STATE_PERF;
++			stat->cpuid_profile_state_perf_equal_samples++;
++		}
++	}
++
++	if ((vmentry_ctl & VM_ENTRY_LOAD_IA32_PAT) ||
++	    (vmexit_ctl & (VM_EXIT_LOAD_IA32_PAT | VM_EXIT_SAVE_IA32_PAT))) {
++		active_mask |= VMX_CPUID_PROFILE_STATE_PAT;
++		stat->cpuid_profile_state_pat_active_samples++;
++		guest = vmcs_read64(GUEST_IA32_PAT);
++		host = vmcs_read64(HOST_IA32_PAT);
++		stat->cpuid_profile_state_guest_pat = guest;
++		stat->cpuid_profile_state_host_pat = host;
++		if (guest == host) {
++			equal_mask |= VMX_CPUID_PROFILE_STATE_PAT;
++			stat->cpuid_profile_state_pat_equal_samples++;
++		}
++	}
++
++	if ((vmentry_ctl & VM_ENTRY_LOAD_IA32_EFER) ||
++	    (vmexit_ctl & (VM_EXIT_LOAD_IA32_EFER | VM_EXIT_SAVE_IA32_EFER))) {
++		active_mask |= VMX_CPUID_PROFILE_STATE_EFER;
++		stat->cpuid_profile_state_efer_active_samples++;
++		guest = vmcs_read64(GUEST_IA32_EFER);
++		host = vmcs_read64(HOST_IA32_EFER);
++		stat->cpuid_profile_state_guest_efer = guest;
++		stat->cpuid_profile_state_host_efer = host;
++		if (guest == host) {
++			equal_mask |= VMX_CPUID_PROFILE_STATE_EFER;
++			stat->cpuid_profile_state_efer_equal_samples++;
++		}
++	}
++
++	if ((vmentry_ctl & VM_ENTRY_LOAD_CET_STATE) ||
++	    (vmexit_ctl & VM_EXIT_LOAD_CET_STATE)) {
++		u64 guest_s_cet = vmcs_readl(GUEST_S_CET);
++		u64 host_s_cet = vmcs_readl(HOST_S_CET);
++		u64 guest_ssp = vmcs_readl(GUEST_SSP);
++		u64 host_ssp = vmcs_readl(HOST_SSP);
++		u64 guest_intr_ssp = vmcs_readl(GUEST_INTR_SSP_TABLE);
++		u64 host_intr_ssp = vmcs_readl(HOST_INTR_SSP_TABLE);
++
++		active_mask |= VMX_CPUID_PROFILE_STATE_CET;
++		stat->cpuid_profile_state_cet_active_samples++;
++		stat->cpuid_profile_state_guest_s_cet = guest_s_cet;
++		stat->cpuid_profile_state_host_s_cet = host_s_cet;
++		stat->cpuid_profile_state_guest_ssp = guest_ssp;
++		stat->cpuid_profile_state_host_ssp = host_ssp;
++		stat->cpuid_profile_state_guest_intr_ssp_table = guest_intr_ssp;
++		stat->cpuid_profile_state_host_intr_ssp_table = host_intr_ssp;
++		if (guest_s_cet == host_s_cet && guest_ssp == host_ssp &&
++		    guest_intr_ssp == host_intr_ssp) {
++			equal_mask |= VMX_CPUID_PROFILE_STATE_CET;
++			stat->cpuid_profile_state_cet_equal_samples++;
++		}
++	}
++
++	stat->cpuid_profile_state_samples++;
++	stat->cpuid_profile_state_active_mask = active_mask;
++	stat->cpuid_profile_state_equal_mask = equal_mask;
++	stat->cpuid_profile_vmcs_valid = 1;
++	vmx->cpuid_profile_vmcs_valid = true;
++}
++
+ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
+ {
+ 	bool force_immediate_exit = run_flags & KVM_RUN_FORCE_IMMEDIATE_EXIT;
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	u64 cpuid_profile_samples_before = vcpu->stat.cpuid_profile_samples;
++	u64 cpuid_inner_blockers;
+ 	unsigned long cr3, cr4;
++	unsigned int vmx_run_flags;
+ 
+ 	/* Record the guest's net vcpu time for enforced NMI injections. */
+ 	if (unlikely(!enable_vnmi &&
+@@ -7605,8 +8069,50 @@
+ 
+ 	kvm_wait_lapic_expire(vcpu);
+ 
++	if (vmx->cpuid_fast_cache_generation !=
++	    vcpu->stat.cpuid_dynamic_generation)
++		vmx_cpuid_fast_cache_refresh(vmx);
+ 	/* The actual VMENTER/EXIT is in the .noinstr.text section. */
+-	vmx_vcpu_enter_exit(vcpu, __vmx_vcpu_run_flags(vmx));
++	vmx_run_flags = __vmx_vcpu_run_flags(vmx);
++	cpuid_inner_blockers =
++		vmx_cpuid_inner_fastpath_blockers(vmx, force_immediate_exit);
++	vcpu->stat.cpuid_inner_blockers = cpuid_inner_blockers;
++	if (unlikely(READ_ONCE(fast_cpuid_inner_debug)) &&
++	    (!vmx->cpuid_inner_debug_seen ||
++	     vmx->cpuid_inner_last_blockers != cpuid_inner_blockers)) {
++		vmx->cpuid_inner_debug_seen = true;
++		vmx->cpuid_inner_last_blockers = cpuid_inner_blockers;
++		pr_info_ratelimited("CPUID inner vCPU %d blockers=%#llx\n",
++				    vcpu->vcpu_id, cpuid_inner_blockers);
++	}
++	if (!cpuid_inner_blockers) {
++		vmx_run_flags |= VMX_RUN_CPUID_INNER_FASTPATH;
++		if (READ_ONCE(fast_cpuid_inner_profile)) {
++			vmx_run_flags |= VMX_RUN_CPUID_PROFILE;
++		} else {
++			vmx->cpuid_profile_vmcs_valid = false;
++			vcpu->stat.cpuid_profile_vmcs_valid = 0;
++		}
++		if (READ_ONCE(fast_cpuid_inner_early)) {
++			vmx_run_flags |= VMX_RUN_CPUID_INNER_EARLY;
++			vcpu->stat.cpuid_inner_early_armed = 1;
++		} else {
++			vcpu->stat.cpuid_inner_early_armed = 0;
++		}
++		if (vmx_cpuid_inner_can_skip_rfds_verw()) {
++			vmx_run_flags |= VMX_RUN_CPUID_INNER_SKIP_RFDS_VERW;
++			vcpu->stat.cpuid_inner_rfds_skip_armed = 1;
++		} else {
++			vcpu->stat.cpuid_inner_rfds_skip_armed = 0;
++		}
++	} else {
++		vcpu->stat.cpuid_inner_rfds_skip_armed = 0;
++		vcpu->stat.cpuid_inner_early_armed = 0;
++	}
++	vmx_vcpu_enter_exit(vcpu, vmx_run_flags);
++	if ((vmx_run_flags & VMX_RUN_CPUID_PROFILE) &&
++	    vcpu->stat.cpuid_profile_samples != cpuid_profile_samples_before)
++		vmx_cpuid_profile_state_audit(vmx);
+ 
+ 	/* All fields are clean at this point */
+ 	if (kvm_is_using_evmcs()) {
+@@ -7784,6 +8290,8 @@
+ {
+ 	if (!ple_gap)
+ 		kvm_disable_exits(kvm, KVM_X86_DISABLE_EXITS_PAUSE);
++	if (boot_cpu_has(X86_FEATURE_APERFMPERF))
++		kvm_disable_exits(kvm, KVM_X86_DISABLE_EXITS_APERFMPERF);
+ 
+ 	if (boot_cpu_has(X86_BUG_L1TF) && enable_ept) {
+ 		switch (l1tf_mitigation) {
+@@ -7979,9 +8487,97 @@
+ 		vmx->pt_desc.ctl_bitmask &= ~(0xfULL << (32 + i * 4));
+ }
+ 
++static bool vmx_cpuid_fast_cacheable_function(struct kvm_vcpu *vcpu,
++					       u32 function)
++{
++	bool indexed = false, nonindexed = false;
++	int i;
++
++	for (i = 0; i < vcpu->arch.cpuid_nent; i++) {
++		struct kvm_cpuid_entry2 *entry = &vcpu->arch.cpuid_entries[i];
++
++		if (entry->function != function)
++			continue;
++		if (entry->flags & (KVM_CPUID_FLAG_STATEFUL_FUNC |
++				    KVM_CPUID_FLAG_STATE_READ_NEXT))
++			return false;
++		if (entry->flags & KVM_CPUID_FLAG_SIGNIFCANT_INDEX)
++			indexed = true;
++		else
++			nonindexed = true;
++	}
++
++	/* Mixed modes require preserving entry order across two lookup keys. */
++	return !(indexed && nonindexed);
++}
++
+ void vmx_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	struct kvm_cpuid_entry2 *entry;
++	struct vmx_cpuid_fast_cache_entry *slot;
++	u32 function, index, hash, flags;
++	u32 value_eax, value_ebx, value_ecx, value_edx;
++	int i, probe;
++
++	vmx->cpuid_fast_mru = NULL;
++	memset(vmx->cpuid_fast_cache, 0, sizeof(vmx->cpuid_fast_cache));
++	for (i = 0; i < vcpu->arch.cpuid_nent; i++) {
++		entry = &vcpu->arch.cpuid_entries[i];
++		function = entry->function;
++
++		if (!vmx_cpuid_fast_cacheable_function(vcpu, function))
++			continue;
++
++		flags = VMX_CPUID_FAST_CACHE_VALID;
++		if (entry->flags & KVM_CPUID_FLAG_SIGNIFCANT_INDEX) {
++			flags |= VMX_CPUID_FAST_CACHE_INDEXED;
++			index = entry->index;
++		} else {
++			index = 0;
++		}
++
++		hash = ((function * 0x9e3779b1U) ^
++			(index * 0x85ebca6bU)) >> 24;
++		for (probe = 0; probe < VMX_CPUID_FAST_CACHE_PROBES; probe++) {
++			slot = &vmx->cpuid_fast_cache[
++				(hash + probe) & (VMX_CPUID_FAST_CACHE_SIZE - 1)];
++			if (!(slot->flags & VMX_CPUID_FAST_CACHE_VALID))
++				break;
++			if (slot->function == function && slot->index == index &&
++			    (slot->flags & VMX_CPUID_FAST_CACHE_INDEXED) ==
++			    (flags & VMX_CPUID_FAST_CACHE_INDEXED))
++				goto next_entry;
++		}
++		if (probe == VMX_CPUID_FAST_CACHE_PROBES)
++			continue;
++
++		slot->function = function;
++		slot->index = index;
++		vmx_cpuid_fast_cache_value(vcpu, entry, &value_eax, &value_ebx,
++						    &value_ecx, &value_edx);
++		slot->eax = value_eax;
++		slot->ebx = value_ebx;
++		slot->ecx = value_ecx;
++		slot->edx = value_edx;
++		slot->flags = flags;
++next_entry:
++		continue;
++	}
++
++	vmx_cpuid_fast_cache_synthetic(vmx);
++
++	entry = kvm_find_cpuid_entry(vcpu, 0);
++	if (entry) {
++		vmx->cpuid0_cache.eax = entry->eax;
++		vmx->cpuid0_cache.ebx = entry->ebx;
++		vmx->cpuid0_cache.ecx = entry->ecx;
++		vmx->cpuid0_cache.edx = entry->edx;
++		vmx->cpuid0_cache.valid = true;
++	} else {
++		vmx->cpuid0_cache.valid = false;
++	}
++	vmx->cpuid_fast_cache_generation = vcpu->stat.cpuid_dynamic_generation;
+ 
+ 	/*
+ 	 * XSAVES is effectively enabled if and only if XSAVE is also exposed
+@@ -8006,6 +8602,15 @@
+ 			~(FEAT_CTL_VMX_ENABLED_INSIDE_SMX |
+ 			  FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX);
+ 
++	vmx->msr_ia32_feature_control &=
++		~(FEAT_CTL_VMX_ENABLED_INSIDE_SMX |
++		  FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX);
++	if (guest_cpu_cap_has(vcpu, X86_FEATURE_VMX))
++		vmx->msr_ia32_feature_control |=
++			FEAT_CTL_VMX_ENABLED_INSIDE_SMX |
++			FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX;
++	vmx->msr_ia32_feature_control |= FEAT_CTL_LOCKED;
++
+ 	if (guest_cpu_cap_has(vcpu, X86_FEATURE_VMX))
+ 		nested_vmx_cr_fixed1_bits_update(vcpu);
+ 
+diff -Naur old/arch/x86/kvm/vmx/vmx.h new/arch/x86/kvm/vmx/vmx.h
+--- a/arch/x86/kvm/vmx/vmx.h	2026-09-19 14:03:02.730687135 +0800
++++ b/arch/x86/kvm/vmx/vmx.h	2026-09-19 08:11:26.478982253 +0800
+@@ -197,6 +197,33 @@
+ #endif
+ };
+ 
++#define VMX_CPUID_FAST_CACHE_SIZE	256
++#define VMX_CPUID_FAST_CACHE_PROBES	8
++#define VMX_CPUID_FAST_CACHE_VALID	BIT(0)
++#define VMX_CPUID_FAST_CACHE_INDEXED	BIT(1)
++
++#define VMX_CPUID_INNER_BLOCK_DISABLED	BIT_ULL(0)
++#define VMX_CPUID_INNER_BLOCK_IMMEDIATE	BIT_ULL(1)
++#define VMX_CPUID_INNER_BLOCK_TRACE	BIT_ULL(2)
++#define VMX_CPUID_INNER_BLOCK_L1D	BIT_ULL(3)
++#define VMX_CPUID_INNER_BLOCK_MODE	BIT_ULL(4)
++#define VMX_CPUID_INNER_BLOCK_DEBUG	BIT_ULL(5)
++#define VMX_CPUID_INNER_BLOCK_FAULT	BIT_ULL(6)
++#define VMX_CPUID_INNER_BLOCK_DYNAMIC	BIT_ULL(7)
++#define VMX_CPUID_INNER_BLOCK_PMU	BIT_ULL(8)
++#define VMX_CPUID_INNER_BLOCK_XEN	BIT_ULL(9)
++
++struct vmx_cpuid_fast_cache_entry {
++	u32 function;
++	u32 index;
++	u32 eax;
++	u32 ebx;
++	u32 ecx;
++	u32 edx;
++	u32 flags;
++	u32 padding;
++};
++
+ struct vcpu_vmx {
+ 	struct kvm_vcpu       vcpu;
+ 	struct vcpu_vt	      vt;
+@@ -205,6 +232,27 @@
+ 
+ 	u32                   idt_vectoring_info;
+ 	ulong                 rflags;
++	struct {
++		u32 eax, ebx, ecx, edx;
++		bool valid;
++	} cpuid0_cache;
++	struct vmx_cpuid_fast_cache_entry
++		cpuid_fast_cache[VMX_CPUID_FAST_CACHE_SIZE];
++	struct vmx_cpuid_fast_cache_entry *cpuid_fast_mru;
++	u64 cpuid_inner_last_blockers;
++	u64 cpuid_fast_cache_generation;
++	bool cpuid_inner_debug_seen;
++	u64 cpuid_profile_tsc_start;
++	u64 cpuid_profile_tsc_validation;
++	u64 cpuid_profile_tsc_lookup;
++	u64 cpuid_profile_tsc_rip;
++	u64 cpuid_profile_tsc_resume;
++	u64 cpuid_profile_transition_tsc_start;
++	u64 cpuid_profile_transition_elapsed;
++	u32 cpuid_profile_divider;
++	u32 cpuid_profile_transition_armed;
++	u32 cpuid_profile_transition_ready;
++	bool cpuid_profile_vmcs_valid;
+ 
+ 	/*
+ 	 * User return MSRs are always emulated when enabled in the guest, but
+diff -Naur old/arch/x86/kvm/x86.c new/arch/x86/kvm/x86.c
+--- a/arch/x86/kvm/x86.c	2026-09-19 14:03:02.731491690 +0800
++++ b/arch/x86/kvm/x86.c	2026-09-19 14:05:10.745621904 +0800
+@@ -191,6 +191,313 @@
+ bool __read_mostly enable_mediated_pmu;
+ EXPORT_SYMBOL_FOR_KVM_INTERNAL(enable_mediated_pmu);
+ 
++/*
++ * Guest MSR contract:
++ *  1) CPUID-hidden named VT/SVM/HFI MSRs #GP.
++ *  2) vCPU-state MSRs stay on KVM (TSC, APIC, EFER, MTRR, SPEC_CTRL, vPMU…).
++ *  3) Everything else follows host rdmsrq_safe: missing => #GP, present =>
++ *     host value or per-vCPU overlay. Writes never wrmsr the host.
++ *  4) Host control-flow MSRs (LBR/DS) exist but return 0/overlay, not host IPs.
++ *  5) KVM/HV PV MSRs #GP unless guest CPUID has hypervisor.
++ *  6) UCODE_REV is always host silicon; guest WRMSR is discarded (SDM).
++ */
++#define OVO_MSR_IA32_DEBUG_INTERFACE	0x00000c80u
++#define OVO_MISC_ENABLE_KEEP (MSR_IA32_MISC_ENABLE_FAST_STRING | \
++			      MSR_IA32_MISC_ENABLE_TM1 | \
++			      MSR_IA32_MISC_ENABLE_EMON | \
++			      MSR_IA32_MISC_ENABLE_BTS_UNAVAIL | \
++			      MSR_IA32_MISC_ENABLE_PEBS_UNAVAIL | \
++			      MSR_IA32_MISC_ENABLE_ENHANCED_SPEEDSTEP | \
++			      MSR_IA32_MISC_ENABLE_XTPR_DISABLE)
++
++static bool ovo_msr_hidden_by_cpuid(struct kvm_vcpu *vcpu, u32 msr)
++{
++	if (!guest_cpu_cap_has(vcpu, X86_FEATURE_VMX) &&
++	    msr >= MSR_IA32_VMX_BASIC && msr <= MSR_IA32_VMX_PROCBASED_CTLS3)
++		return true;
++
++	if (!guest_cpu_cap_has(vcpu, X86_FEATURE_SVM) &&
++	    (msr == MSR_VM_CR || msr == MSR_VM_IGNNE ||
++	     msr == MSR_VM_HSAVE_PA || msr == MSR_AMD64_SVM_AVIC_DOORBELL))
++		return true;
++
++	if (msr == MSR_IA32_HW_FEEDBACK_PTR ||
++	    msr == MSR_IA32_HW_FEEDBACK_CONFIG ||
++	    msr == 0x17d2 || msr == 0x17d4 || msr == 0x17da)
++		return true;
++
++	return false;
++}
++
++static bool ovo_msr_is_kvm_pv(u32 msr)
++{
++	switch (msr) {
++	case MSR_KVM_WALL_CLOCK:
++	case MSR_KVM_SYSTEM_TIME:
++	case MSR_KVM_WALL_CLOCK_NEW:
++	case MSR_KVM_SYSTEM_TIME_NEW:
++	case MSR_KVM_ASYNC_PF_EN:
++	case MSR_KVM_ASYNC_PF_INT:
++	case MSR_KVM_ASYNC_PF_ACK:
++	case MSR_KVM_STEAL_TIME:
++	case MSR_KVM_PV_EOI_EN:
++	case MSR_KVM_POLL_CONTROL:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool ovo_msr_is_hv_pv(u32 msr)
++{
++#ifdef CONFIG_KVM_HYPERV
++	if (msr >= HV_X64_MSR_GUEST_OS_ID && msr <= HV_X64_MSR_SINT15)
++		return true;
++	if (msr >= HV_X64_MSR_SYNDBG_CONTROL &&
++	    msr <= HV_X64_MSR_SYNDBG_PENDING_BUFFER)
++		return true;
++	if (msr == HV_X64_MSR_SYNDBG_OPTIONS)
++		return true;
++	if (msr >= HV_X64_MSR_CRASH_P0 && msr <= HV_X64_MSR_CRASH_P4)
++		return true;
++	if (msr == HV_X64_MSR_CRASH_CTL)
++		return true;
++	if (msr >= HV_X64_MSR_STIMER0_CONFIG && msr <= HV_X64_MSR_STIMER3_COUNT)
++		return true;
++	if (msr == HV_X64_MSR_REENLIGHTENMENT_CONTROL ||
++	    msr == HV_X64_MSR_TSC_EMULATION_CONTROL ||
++	    msr == HV_X64_MSR_TSC_EMULATION_STATUS ||
++	    msr == HV_X64_MSR_TSC_INVARIANT_CONTROL)
++		return true;
++#endif
++	return false;
++}
++
++static bool ovo_msr_is_virtualized(struct kvm_vcpu *vcpu, u32 msr)
++{
++	if ((ovo_msr_is_kvm_pv(msr) || ovo_msr_is_hv_pv(msr)) &&
++	    !guest_cpu_cap_has(vcpu, X86_FEATURE_HYPERVISOR))
++		return false;
++
++	switch (msr) {
++	case MSR_EFER:
++	case MSR_STAR:
++	case MSR_LSTAR:
++	case MSR_CSTAR:
++	case MSR_SYSCALL_MASK:
++	case MSR_FS_BASE:
++	case MSR_GS_BASE:
++	case MSR_KERNEL_GS_BASE:
++	case MSR_IA32_SYSENTER_CS:
++	case MSR_IA32_SYSENTER_EIP:
++	case MSR_IA32_SYSENTER_ESP:
++	case MSR_IA32_CR_PAT:
++	case MSR_MTRRcap:
++	case MTRRphysBase_MSR(0) ... MSR_MTRRfix4K_F8000:
++	case MSR_MTRRdefType:
++	case MSR_IA32_APICBASE:
++	case APIC_BASE_MSR ... APIC_BASE_MSR + 0xff:
++	case MSR_IA32_TSC:
++	case MSR_IA32_TSC_DEADLINE:
++	case MSR_IA32_TSC_ADJUST:
++	case MSR_TSC_AUX:
++	case MSR_IA32_MISC_ENABLE:
++	case MSR_IA32_SMBASE:
++	case MSR_IA32_POWER_CTL:
++	case MSR_IA32_XSS:
++	case MSR_IA32_ARCH_CAPABILITIES:
++	case MSR_IA32_PERF_CAPABILITIES:
++	case MSR_MISC_FEATURES_ENABLES:
++	case MSR_IA32_PRED_CMD:
++	case MSR_IA32_FLUSH_CMD:
++	case MSR_IA32_SPEC_CTRL:
++	case MSR_IA32_TSX_CTRL:
++	case MSR_IA32_DEBUGCTLMSR:
++	case MSR_IA32_BNDCFGS:
++	case MSR_IA32_UMWAIT_CONTROL:
++	case MSR_IA32_U_CET:
++	case MSR_IA32_S_CET:
++	case MSR_IA32_PL0_SSP ... MSR_IA32_PL3_SSP:
++	case MSR_IA32_INT_SSP_TAB:
++	case MSR_KVM_INTERNAL_GUEST_SSP:
++#ifdef CONFIG_X86_64
++	case MSR_IA32_XFD:
++	case MSR_IA32_XFD_ERR:
++#endif
++	case MSR_IA32_MCG_CAP:
++	case MSR_IA32_MCG_CTL:
++	case MSR_IA32_MCG_STATUS:
++	case MSR_IA32_MCG_EXT_CTL:
++	case MSR_IA32_P5_MC_ADDR:
++	case MSR_IA32_P5_MC_TYPE:
++	case MSR_IA32_MC0_CTL ... MSR_IA32_MCx_CTL(KVM_MAX_MCE_BANKS) - 1:
++	case MSR_IA32_MC0_CTL2 ... MSR_IA32_MCx_CTL2(KVM_MAX_MCE_BANKS) - 1:
++	case MSR_KVM_WALL_CLOCK:
++	case MSR_KVM_SYSTEM_TIME:
++	case MSR_KVM_WALL_CLOCK_NEW:
++	case MSR_KVM_SYSTEM_TIME_NEW:
++	case MSR_KVM_ASYNC_PF_EN:
++	case MSR_KVM_ASYNC_PF_INT:
++	case MSR_KVM_ASYNC_PF_ACK:
++	case MSR_KVM_STEAL_TIME:
++	case MSR_KVM_PV_EOI_EN:
++	case MSR_KVM_POLL_CONTROL:
++#ifdef CONFIG_KVM_HYPERV
++	case HV_X64_MSR_GUEST_OS_ID ... HV_X64_MSR_SINT15:
++	case HV_X64_MSR_SYNDBG_CONTROL ... HV_X64_MSR_SYNDBG_PENDING_BUFFER:
++	case HV_X64_MSR_SYNDBG_OPTIONS:
++	case HV_X64_MSR_CRASH_P0 ... HV_X64_MSR_CRASH_P4:
++	case HV_X64_MSR_CRASH_CTL:
++	case HV_X64_MSR_STIMER0_CONFIG ... HV_X64_MSR_STIMER3_COUNT:
++	case HV_X64_MSR_REENLIGHTENMENT_CONTROL:
++	case HV_X64_MSR_TSC_EMULATION_CONTROL:
++	case HV_X64_MSR_TSC_EMULATION_STATUS:
++	case HV_X64_MSR_TSC_INVARIANT_CONTROL:
++#endif
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool ovo_msr_hide_host_payload(u32 msr)
++{
++	if (msr == MSR_IA32_DS_AREA || msr == MSR_LBR_SELECT || msr == MSR_LBR_TOS)
++		return true;
++	if (msr == MSR_IA32_LASTBRANCHFROMIP || msr == MSR_IA32_LASTBRANCHTOIP ||
++	    msr == MSR_IA32_LASTINTFROMIP || msr == MSR_IA32_LASTINTTOIP)
++		return true;
++	if (msr >= MSR_LBR_CORE_FROM && msr <= MSR_LBR_CORE_FROM + 7)
++		return true;
++	if (msr >= MSR_LBR_CORE_TO && msr <= MSR_LBR_CORE_TO + 7)
++		return true;
++	if (msr >= MSR_LBR_NHM_FROM && msr <= MSR_LBR_NHM_FROM + 31)
++		return true;
++	if (msr >= MSR_LBR_NHM_TO && msr <= MSR_LBR_NHM_TO + 31)
++		return true;
++	if (msr >= MSR_LBR_INFO_0 && msr <= MSR_LBR_INFO_0 + 31)
++		return true;
++	return false;
++}
++
++static bool ovo_msr_write_is_ro(u32 msr)
++{
++	switch (msr) {
++	case MSR_IA32_PERF_STATUS:
++	case MSR_IA32_PLATFORM_ID:
++	case MSR_PLATFORM_INFO:
++	case 0xcd:
++	case MSR_EBC_FREQUENCY_ID:
++	case MSR_RAPL_POWER_UNIT:
++	case MSR_PP0_ENERGY_STATUS:
++	case MSR_PP1_ENERGY_STATUS:
++	case MSR_PKG_ENERGY_STATUS:
++	case MSR_DRAM_ENERGY_STATUS:
++	case MSR_IA32_TEMPERATURE_TARGET:
++	case MSR_TURBO_RATIO_LIMIT:
++	case MSR_TURBO_RATIO_LIMIT1:
++	case MSR_TURBO_RATIO_LIMIT2:
++	case MSR_HWP_CAPABILITIES:
++	case MSR_SMI_COUNT:
++	case OVO_MSR_IA32_DEBUG_INTERFACE:
++	case 0x0db0:
++	case 0x0db1:
++	case 0x0db2:
++	case 0x0982:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool ovo_msr_write_discard(u32 msr)
++{
++	return msr == MSR_IA32_THERM_STATUS || msr == MSR_HWP_STATUS ||
++	       msr == MSR_IA32_UCODE_REV;
++}
++
++static bool ovo_msr_overlay_lookup(struct kvm_vcpu *vcpu, u32 msr, u64 *data)
++{
++	u16 i, n = vcpu->arch.ovo_msr_overlay_n;
++
++	for (i = 0; i < n; i++) {
++		if (vcpu->arch.ovo_msr_overlay_idx[i] == msr) {
++			*data = vcpu->arch.ovo_msr_overlay_val[i];
++			return true;
++		}
++	}
++	return false;
++}
++
++static int ovo_msr_overlay_store(struct kvm_vcpu *vcpu, u32 msr, u64 data)
++{
++	u16 i, n = vcpu->arch.ovo_msr_overlay_n;
++
++	for (i = 0; i < n; i++) {
++		if (vcpu->arch.ovo_msr_overlay_idx[i] == msr) {
++			vcpu->arch.ovo_msr_overlay_val[i] = data;
++			return 0;
++		}
++	}
++	if (n >= ARRAY_SIZE(vcpu->arch.ovo_msr_overlay_idx))
++		return KVM_MSR_RET_UNSUPPORTED;
++	vcpu->arch.ovo_msr_overlay_idx[n] = msr;
++	vcpu->arch.ovo_msr_overlay_val[n] = data;
++	vcpu->arch.ovo_msr_overlay_n = n + 1;
++	return 0;
++}
++
++static int ovo_msr_guest_read(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
++{
++	u64 host_val;
++	u32 msr = msr_info->index;
++
++	if (msr_info->host_initiated)
++		return KVM_MSR_RET_UNSUPPORTED;
++	if (ovo_msr_hidden_by_cpuid(vcpu, msr))
++		return KVM_MSR_RET_UNSUPPORTED;
++	if (msr == MSR_IA32_UCODE_REV) {
++		if (rdmsrq_safe(msr, &msr_info->data))
++			return KVM_MSR_RET_UNSUPPORTED;
++		return 0;
++	}
++	if (ovo_msr_overlay_lookup(vcpu, msr, &msr_info->data))
++		return 0;
++	if (msr == OVO_MSR_IA32_DEBUG_INTERFACE) {
++		if (rdmsrq_safe(msr, &host_val))
++			return KVM_MSR_RET_UNSUPPORTED;
++		msr_info->data = BIT_ULL(30);
++		return 0;
++	}
++	if (ovo_msr_hide_host_payload(msr)) {
++		if (rdmsrq_safe(msr, &host_val))
++			return KVM_MSR_RET_UNSUPPORTED;
++		msr_info->data = 0;
++		return 0;
++	}
++	if (rdmsrq_safe(msr, &msr_info->data))
++		return KVM_MSR_RET_UNSUPPORTED;
++	return 0;
++}
++
++static int ovo_msr_guest_write(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
++{
++	u64 host_val;
++	u32 msr = msr_info->index;
++
++	if (msr_info->host_initiated)
++		return KVM_MSR_RET_UNSUPPORTED;
++	if (ovo_msr_hidden_by_cpuid(vcpu, msr))
++		return KVM_MSR_RET_UNSUPPORTED;
++	if (ovo_msr_write_is_ro(msr))
++		return KVM_MSR_RET_UNSUPPORTED;
++	if (rdmsrq_safe(msr, &host_val))
++		return KVM_MSR_RET_UNSUPPORTED;
++	if (ovo_msr_write_discard(msr))
++		return 0;
++	return ovo_msr_overlay_store(vcpu, msr, msr_info->data);
++}
++
+ bool __read_mostly eager_page_split = true;
+ module_param(eager_page_split, bool, 0644);
+ 
+@@ -307,6 +614,16 @@
+ 	STATS_DESC_COUNTER(VCPU, preemption_other),
+ 	STATS_DESC_IBOOLEAN(VCPU, guest_mode),
+ 	STATS_DESC_COUNTER(VCPU, notify_window_exits),
++	STATS_DESC_COUNTER(VCPU, cpuid_fastpath),
++	STATS_DESC_COUNTER(VCPU, cpuid_fastpath_fallback),
++	STATS_DESC_COUNTER(VCPU, cpuid_inner_fastpath),
++	STATS_DESC_COUNTER(VCPU, cpuid_inner_cache_miss),
++	STATS_DESC_ICOUNTER(VCPU, cpuid_inner_blockers),
++	STATS_DESC_COUNTER(VCPU, cpuid_profile_samples),
++	STATS_DESC_COUNTER(VCPU, cpuid_profile_validation_cycles),
++	STATS_DESC_COUNTER(VCPU, cpuid_profile_lookup_cycles),
++	STATS_DESC_COUNTER(VCPU, cpuid_profile_rip_cycles),
++	STATS_DESC_COUNTER(VCPU, cpuid_profile_resume_cycles),
+ };
+ 
+ const struct kvm_stats_header kvm_vcpu_stats_header = {
+@@ -3908,6 +4225,14 @@
+ 	u32 msr = msr_info->index;
+ 	u64 data = msr_info->data;
+ 
++	if (!msr_info->host_initiated && ovo_msr_hidden_by_cpuid(vcpu, msr))
++		return KVM_MSR_RET_UNSUPPORTED;
++	if (!msr_info->host_initiated && !ovo_msr_is_virtualized(vcpu, msr)) {
++		if (kvm_pmu_is_valid_msr(vcpu, msr))
++			return kvm_pmu_set_msr(vcpu, msr_info);
++		return ovo_msr_guest_write(vcpu, msr_info);
++	}
++
+ 	/*
+ 	 * Do not allow host-initiated writes to trigger the Xen hypercall
+ 	 * page setup; it could incur locking paths which are not expected
+@@ -4298,7 +4623,7 @@
+ 		if (kvm_pmu_is_valid_msr(vcpu, msr))
+ 			return kvm_pmu_set_msr(vcpu, msr_info);
+ 
+-		return KVM_MSR_RET_UNSUPPORTED;
++		return ovo_msr_guest_write(vcpu, msr_info);
+ 	}
+ 	return 0;
+ }
+@@ -4356,6 +4681,16 @@
+ 
+ int kvm_get_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ {
++	if (!msr_info->host_initiated &&
++	    ovo_msr_hidden_by_cpuid(vcpu, msr_info->index))
++		return KVM_MSR_RET_UNSUPPORTED;
++	if (!msr_info->host_initiated &&
++	    !ovo_msr_is_virtualized(vcpu, msr_info->index)) {
++		if (kvm_pmu_is_valid_msr(vcpu, msr_info->index))
++			return kvm_pmu_get_msr(vcpu, msr_info);
++		return ovo_msr_guest_read(vcpu, msr_info);
++	}
++
+ 	switch (msr_info->index) {
+ 	case MSR_IA32_PLATFORM_ID:
+ 	case MSR_IA32_EBL_CR_POWERON:
+@@ -4580,16 +4910,28 @@
+ 	case MSR_IA32_UCODE_REV:
+-		msr_info->data = vcpu->arch.microcode_version;
++		if (!msr_info->host_initiated &&
++		    !rdmsrq_safe(MSR_IA32_UCODE_REV, &msr_info->data))
++			break;
++		msr_info->data = vcpu->arch.microcode_version;
+ 		break;
+ 	case MSR_IA32_ARCH_CAPABILITIES:
+ 		if (!guest_cpu_cap_has(vcpu, X86_FEATURE_ARCH_CAPABILITIES))
+ 			return KVM_MSR_RET_UNSUPPORTED;
+-		msr_info->data = vcpu->arch.arch_capabilities;
++		if (!msr_info->host_initiated &&
++		    !rdmsrq_safe(MSR_IA32_ARCH_CAPABILITIES, &msr_info->data))
++			break;
++		msr_info->data = vcpu->arch.arch_capabilities;
+ 		break;
+ 	case MSR_IA32_PERF_CAPABILITIES:
+ 		if (!guest_cpu_cap_has(vcpu, X86_FEATURE_PDCM))
+ 			return KVM_MSR_RET_UNSUPPORTED;
+-		msr_info->data = vcpu->arch.perf_capabilities;
++		if (!msr_info->host_initiated &&
++		    !rdmsrq_safe(MSR_IA32_PERF_CAPABILITIES, &msr_info->data))
++			break;
++		msr_info->data = vcpu->arch.perf_capabilities;
+ 		break;
+ 	case MSR_IA32_POWER_CTL:
+-		msr_info->data = vcpu->arch.msr_ia32_power_ctl;
++		if (!msr_info->host_initiated &&
++		    !rdmsrq_safe(MSR_IA32_POWER_CTL, &msr_info->data))
++			break;
++		msr_info->data = vcpu->arch.msr_ia32_power_ctl;
+ 		break;
+@@ -4638,4 +4962,11 @@
+ 	case MSR_IA32_MISC_ENABLE:
+ 		msr_info->data = vcpu->arch.ia32_misc_enable_msr;
++		if (!msr_info->host_initiated) {
++			u64 host_val;
++
++			if (!rdmsrq_safe(MSR_IA32_MISC_ENABLE, &host_val))
++				msr_info->data = (msr_info->data & ~OVO_MISC_ENABLE_KEEP) |
++						 (host_val & OVO_MISC_ENABLE_KEEP);
++		}
+ 		break;
+ 	case MSR_IA32_SMBASE:
+@@ -4651,7 +5005,7 @@
+ 		if (kvm_pmu_is_valid_msr(vcpu, msr_info->index))
+ 			return kvm_pmu_get_msr(vcpu, msr_info);
+ 
+-		return KVM_MSR_RET_UNSUPPORTED;
++		return ovo_msr_guest_read(vcpu, msr_info);
+ 	}
+ 	return 0;
+ }
+@@ -9265,6 +9600,7 @@
+ static int kvm_vcpu_do_singlestep(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_run *kvm_run = vcpu->run;
++	u32 dr6;
+ 
+ 	if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) {
+ 		kvm_run->debug.arch.dr6 = DR6_BS | DR6_ACTIVE_LOW;
+@@ -9273,7 +9609,9 @@
+ 		kvm_run->exit_reason = KVM_EXIT_DEBUG;
+ 		return 0;
+ 	}
+-	kvm_queue_exception_p(vcpu, DB_VECTOR, DR6_BS);
++	dr6 = kvm_vcpu_check_hw_bp(kvm_get_linear_rip(vcpu), DR_RW_EXECUTE,
++				   vcpu->arch.dr7, vcpu->arch.db);
++	kvm_queue_exception_p(vcpu, DB_VECTOR, DR6_BS | dr6);
+ 	return 1;
+ }
+ 
+@@ -10557,7 +10895,8 @@
+ 	 * If the quirk is disabled, synthesize a #UD and let the guest pick up
+ 	 * the pieces.
+ 	 */
+-	if (!kvm_check_has_quirk(vcpu->kvm, KVM_X86_QUIRK_FIX_HYPERCALL_INSN)) {
++	if (!guest_cpu_cap_has(vcpu, X86_FEATURE_HYPERVISOR) ||
++	    !kvm_check_has_quirk(vcpu->kvm, KVM_X86_QUIRK_FIX_HYPERCALL_INSN)) {
+ 		ctxt->exception.error_code_valid = false;
+ 		ctxt->exception.vector = UD_VECTOR;
+ 		ctxt->have_exception = true;
+
+diff -Naur old/arch/x86/kvm/x86.c new/arch/x86/kvm/x86.c
+--- old/arch/x86/kvm/x86.c	2026-09-19 14:03:02.731491690 +0800
++++ new/arch/x86/kvm/x86.c	2026-09-19 15:30:00.000000000 +0800
+@@ -13190,5 +13580,18 @@
+ 		vcpu->arch.msr_misc_features_enables = 0;
+ 		vcpu->arch.ia32_misc_enable_msr = MSR_IA32_MISC_ENABLE_PEBS_UNAVAIL |
+ 						  MSR_IA32_MISC_ENABLE_BTS_UNAVAIL;
++		{
++			u64 host_val;
++
++			if (!rdmsrq_safe(MSR_IA32_MISC_ENABLE, &host_val))
++				vcpu->arch.ia32_misc_enable_msr =
++					(vcpu->arch.ia32_misc_enable_msr &
++					 ~OVO_MISC_ENABLE_KEEP) |
++					(host_val & OVO_MISC_ENABLE_KEEP);
++			if (!rdmsrq_safe(MSR_IA32_POWER_CTL, &host_val))
++				vcpu->arch.msr_ia32_power_ctl = host_val;
++			if (!rdmsrq_safe(MSR_IA32_UCODE_REV, &host_val))
++				vcpu->arch.microcode_version = host_val;
++		}
+ 
+ 		__kvm_set_xcr(vcpu, 0, XFEATURE_MASK_FP);

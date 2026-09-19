@@ -77,6 +77,7 @@ Do not delete it.
 | `7.1.3-1.intel.v2-timing16-deferred-reg-sync.patch` | Intel | 7.1.3-1; rejected deferred GPR-sync experiment (archive only) |
 | `7.1.3-1.intel.v2-timing17-mru-cache.patch` | Intel | 7.1.3-1; clean baseline plus generation-safe per-vCPU CPUID MRU lookup |
 | `7.1.3-1.intel.v2-timing17-msr.patch` | Intel | 7.1.3-1; timing17 plus CPUID-gated host RDMSR (writes never hit host) |
+| `7.1.3-1.intel.v2-msr-silicon.patch` | Intel | 7.1.3-1; timing17 plus silicon-default guest MSR contract |
 | `7.1.3-1.intel.v2-timing6-profile.patch` | Intel | 7.1.3-1; timing5 plus opt-in sampled cycle profiling |
 | `7.1.3-1.amd.patch` | AMD | 7.1.3-1 |
 | `7.2.2-1.amd.patch` | AMD | 7.2.2-1 |
@@ -95,6 +96,36 @@ module tree is not owned by pacman. Its prepared build tree must remain at
   --source-archive /home/lx/.cache/ovo-kvm/downloads/linux-6.19.14.tar.gz \
   --work-dir .work/nika-fixed
 ```
+
+## Intel v2 silicon-default MSRs (2026-09-19)
+
+`7.1.3-1.intel.v2-msr-silicon.patch` is timing17-msr with the guest MSR
+default inverted. vCPU-state MSRs (TSC, APIC, EFER, MTRR, SPEC_CTRL,
+vPMU, MCE) stay on KVM. KVM/HV PV MSRs `#GP` unless guest CPUID has
+hypervisor. Every other guest RDMSR/WRMSR follows host `rdmsrq_safe`:
+missing => #GP, present => host value or per-vCPU overlay. KVM fake
+zeros/constants (`PERF_STATUS` 4x, RAPL=0, `PLATFORM_ID`=0,
+`BBL_CR_CTL3`, Intel guests seeing AMD `K7_CLK_CTL`) no longer win on
+the guest path. Writes never `wrmsr` the host.
+`IA32_FEAT_CTL` (0x3A) reads as LOCKED with VMX bits taken from guest
+CPUID (not the host). `IA32_DEBUG_INTERFACE` (0xC80) reads LOCKED.
+`IA32_UCODE_REV` (0x8B) always reads host silicon; guest `WRMSR` is
+discarded. Guest-visible `MISC_ENABLE` keeps host identity bits
+(Fast-Strings, TM1, EMON, BTS/PEBS unavailable, EIST, xTPR disable).
+Guest reads of `POWER_CTL`, `ARCH_CAPABILITIES`, and
+`PERF_CAPABILITIES` return host silicon. LBR/DS_AREA exist if the host
+has them but return 0/overlay, not host RIP. Overlay is 256 slots.
+`ignore_msrs` stays 0. HFI MSRs stay hidden. MTRR_CAP and MCG_CAP stay
+on KVM (they describe what KVM implements, not host bank/range counts).
+
+Close VMs, then:
+
+```bash
+./kvm.sh install --yes \
+  --patch kvm/patches/7.1.3-1.intel.v2-msr-silicon.patch
+```
+
+Reboot afterwards. `01`–`04` stay unchanged.
 
 ## Intel v2 timing17 + host MSR reads (2026-09-17)
 

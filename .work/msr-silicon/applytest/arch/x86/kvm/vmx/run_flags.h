@@ -1,0 +1,17 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef __KVM_X86_VMX_RUN_FLAGS_H
+#define __KVM_X86_VMX_RUN_FLAGS_H
+
+#define VMX_RUN_VMRESUME			BIT(0)
+#define VMX_RUN_SAVE_SPEC_CTRL			BIT(1)
+#define VMX_RUN_CLEAR_CPU_BUFFERS_FOR_MMIO	BIT(2)
+#define VMX_RUN_CPUID_INNER_FASTPATH		BIT(3)
+#define VMX_RUN_CPUID_INNER_SKIP_RFDS_VERW	BIT(4)
+#define VMX_RUN_CPUID_INNER_EARLY		BIT(5)
+/* Transient assembly-only validation state, cleared before the slow path. */
+#define VMX_RUN_CPUID_INNER_EARLY_VALIDATED	BIT(6)
+#define VMX_RUN_CPUID_INNER_EARLY_REJECTED	BIT(7)
+#define VMX_RUN_CPUID_PROFILE			BIT(8)
+#define VMX_RUN_CPUID_PROFILE_SAMPLE		BIT(9)
+
+#endif /* __KVM_X86_VMX_RUN_FLAGS_H */
