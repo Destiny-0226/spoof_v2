@@ -727,6 +727,13 @@ ROUTER_OUIS = (
     ("Xiaomi Communications", (0x64, 0xCC, 0x2E)),
     ("Huawei Technologies", (0x48, 0x46, 0xFB)),
 )
+ROUTER_HOSTNAME_PREFIX = {
+    "TP-Link Technologies": "tplink",
+    "ASUSTek Computer": "asus",
+    "NETGEAR": "netgear",
+    "Xiaomi Communications": "miwifi",
+    "Huawei Technologies": "huawei",
+}
 
 MEMORY_CATALOG: dict[tuple[str, str], dict[int, tuple[tuple[str, str], ...]]] = {
     ("ddr5", "laptop"): {
@@ -2785,6 +2792,25 @@ def random_oui_mac(oui: tuple[int, int, int], excluded: set[str]) -> str:
             return mac
 
 
+def lan_services_identity(
+    gateway_ip: str,
+    gateway_mac: str,
+    manufacturer: str,
+    subnet: ipaddress.IPv4Network,
+) -> dict[str, Any]:
+    prefix = ROUTER_HOSTNAME_PREFIX.get(manufacturer, "router")
+    suffix = gateway_mac.replace(":", "")[-4:]
+    return {
+        "advertise_gateway_as_dns": True,
+        "broadcast": str(subnet.broadcast_address),
+        "dns_domain": "lan",
+        "dns_servers": [gateway_ip],
+        "gateway_hostname": f"{prefix}-{suffix}",
+        "isolation": "guest-only",
+        "lease_seconds": 86400,
+    }
+
+
 def routed_ipv4_networks(prefix: list[str]) -> list[ipaddress.IPv4Network]:
     """Collect host and defined libvirt networks to avoid address conflicts."""
     result = run(["ip", "-j", "-4", "route", "show"], check=False)
@@ -2880,6 +2906,9 @@ def generate_lan_profiles(
                 "mac": gateway_mac,
                 "manufacturer": router_vendor,
             },
+            "lan_services": lan_services_identity(
+                gateway_ip, gateway_mac, router_vendor, subnet,
+            ),
             "libvirt_network": {
                 "name": f"lan-{token[:10]}-{index + 1}",
                 "uuid": str(uuid.uuid4()),
@@ -3711,11 +3740,14 @@ def main() -> int:
         for item in record["devices"]["pci_identities"].get("root_ports") or []:
             print(f"  RP:     {item.get('mapping_reason')}")
         for index, adapter in enumerate(record["identity"]["network_adapters"], 1):
+            services = adapter.get("lan_services") or {}
             print(
                 f"  网络{index}: MAC {adapter['mac']}, "
                 f"IP {adapter['ipv4']['address']}/{adapter['ipv4']['prefix_length']} "
                 f"via {adapter['gateway']['ipv4_address']} "
-                f"({adapter['gateway']['mac']})"
+                f"({adapter['gateway']['mac']}) "
+                f"DHCP {services.get('gateway_hostname', '?')}.{services.get('dns_domain', '?')} "
+                f"isolation={services.get('isolation', '?')}"
             )
         print(f"  UUID:   {record['identity']['system_uuid']}")
         print(

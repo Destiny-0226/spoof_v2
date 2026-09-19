@@ -165,10 +165,11 @@ python3 04_apply_spoof.py
    上，也不再用 `8086:1111` 这种不存在的 Intel GPU；OEM subsystem 仍继承宿主
    显示设备。USB HID 的 iSerialNumber 只用配件池序列号，不再拼接
    `0000:00:14.0` 这类 xHCI PCI 路径。正式环境交由 GPU 直通替代虚拟显示。
-   `04` 删除默认的 QEMU usb-kbd/usb-mouse/tablet/ps2。没有 USB 设备直通、
-   或已有 USB 控制器 PCI 直通时，不生成 `qemu-xhci`，改为
-   `<controller type='usb' model='none'/>`。只有 XML 里仍有 `<hostdev type='usb'>`
-   时才保留涂过身份的 qemu-xhci，用来挂那些被直通的设备。
+   `04` 删除默认的 QEMU usb-kbd/usb-mouse/tablet/ps2，不添加 USB tablet。
+   始终在宿主 PCH 槽位（当前 82RF 为 `00:14.0`）生成涂过身份的 `qemu-xhci`，
+   使用宿主 DID（`8086:51ed`），不写 libvirt `ports='15'`，也不把控制器挂到
+   Root Port 后面。只有把宿主这颗 PCH xHCI 本身 PCI 直通进来宾时，才改为
+   `<controller type='usb' model='none'/>`，避免和直通设备抢同一地址。
    `04` 将 Hyper-V 启蒙全部关掉，并在宿主有 `ibrs`/`spec_ctrl` 时要求
    `spec-ctrl`。MCE bank 数量继承宿主 sysfs；CPU 热插拔 IO 由 profile 锁定
    且 QEMU/OVMF 成对改掉 `0x0CD8`。SMBIOS Type 8/9 原样继承宿主端口和插槽，

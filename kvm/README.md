@@ -76,6 +76,7 @@ Do not delete it.
 | `7.1.3-1.intel.v2-timing15-lazy-perf.patch` | Intel | 7.1.3-1; rejected lazy PERF_GLOBAL_CTRL experiment (archive only) |
 | `7.1.3-1.intel.v2-timing16-deferred-reg-sync.patch` | Intel | 7.1.3-1; rejected deferred GPR-sync experiment (archive only) |
 | `7.1.3-1.intel.v2-timing17-mru-cache.patch` | Intel | 7.1.3-1; clean baseline plus generation-safe per-vCPU CPUID MRU lookup |
+| `7.1.3-1.intel.v2-timing17-msr.patch` | Intel | 7.1.3-1; timing17 plus CPUID-gated host RDMSR (writes never hit host) |
 | `7.1.3-1.intel.v2-timing6-profile.patch` | Intel | 7.1.3-1; timing5 plus opt-in sampled cycle profiling |
 | `7.1.3-1.amd.patch` | AMD | 7.1.3-1 |
 | `7.2.2-1.amd.patch` | AMD | 7.2.2-1 |
@@ -94,6 +95,36 @@ module tree is not owned by pacman. Its prepared build tree must remain at
   --source-archive /home/lx/.cache/ovo-kvm/downloads/linux-6.19.14.tar.gz \
   --work-dir .work/nika-fixed
 ```
+
+## Intel v2 timing17 + host MSR reads (2026-09-17)
+
+`7.1.3-1.intel.v2-timing17-msr.patch` is timing17 plus generic MSR/CPUID
+handling. It does not edit the timing17 file. Unimplemented MSRs follow the
+host `rdmsrq_safe` oracle (#GP). Guest CPUID only hides **named** Intel VT
+and AMD-V MSRs when those features are off. Identity MSRs that KVM used to
+fake are read from the current pCPU and never fall through to KVM constants.
+Guest CPUID host-fill is an allowlist: `0x06`, `0x15`, `0x16`, `0x1A`. `0x06`
+keeps Turbo and HWP, and clears HFI (EAX.19) and ITD (EAX.23) until a
+guest HFI table exists. Advertising HFI made Win10 `WRMSR 0x17D0` then
+`SYSTEM_THREAD_EXCEPTION_NOT_HANDLED` when the write #GP'd.
+
+MSR writes never hit host silicon. RO status (PERF_STATUS, RAPL energy,
+turbo limits, HWP_CAPABILITIES) still #GP. Programmable identity MSRs
+(HWP_REQUEST, PERF_CTL, thermal interrupts, and any other host-existing
+MSR that is not RO) succeed into a per-vCPU overlay; RDMSR returns the
+overlay then the host value. HFI MSRs `0x17D0–0x17DA` stay hidden.
+W1C status (THERM_STATUS, HWP_STATUS) accepts the write and keeps
+host reads. Topology, XML feature masks, vPMU, XSAVE, and
+`0x40000000–0x4fffffff` stay on the KVM/QEMU table.
+
+Close VMs, then:
+
+```bash
+./kvm.sh install --yes \
+  --patch kvm/patches/7.1.3-1.intel.v2-timing17-msr.patch
+```
+
+Reboot afterwards. `01`–`04` stay unchanged.
 
 ## Intel v2 timing5 pre-spill CPUID experiment (2026-09-11)
 

@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -32,8 +33,12 @@ PROFILE_PATH = ARTIFACTS / "identity-hardware.json"
 BUILD = ROOT / "build"
 BACKUPS = ROOT / "backups"
 QEMU_NS = "http://libvirt.org/schemas/domain/qemu/1.0"
+DNSMASQ_NS = "http://libvirt.org/schemas/network/dnsmasq/1.0"
 RUNTIME_ROOT = Path("/opt/ovo-spoof/profiles")
+ISOLATION_TABLE = "ovo-spoof-guest"
+ISOLATION_UNIT = "ovo-spoof-guest-isolation.service"
 ET.register_namespace("qemu", QEMU_NS)
+ET.register_namespace("dnsmasq", DNSMASQ_NS)
 IDENTITY_SCHEMA_VERSION = 32
 ARTIFACT_CONTRACT_VERSION = 1
 SMBIOS_END_MARKER = bytes((127, 4, 0xFF, 0xFE, 0, 0))
@@ -60,6 +65,25 @@ I226_NETWORK_IDENTITY = {
     "firmware_version": "2017:888d",
 }
 I226_EXTENDED_CAPABILITIES = ["aer-v2", "dsn", "ltr", "l1-pm-substates", "ptm"]
+ROUTER_HOSTNAME_PREFIX = {
+    "TP-Link Technologies": "tplink",
+    "ASUSTek Computer": "asus",
+    "NETGEAR": "netgear",
+    "Xiaomi Communications": "miwifi",
+    "Huawei Technologies": "huawei",
+}
+DNS_LABEL_RE = re.compile(r"\A[a-z][a-z0-9-]{0,30}[a-z0-9]\Z")
+PRIVATE_FORWARD_NETWORKS = (
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+)
 
 
 def validate_artifact_contract(profile: dict, smbios: bytes) -> None:
@@ -464,6 +488,8 @@ def validate_usb_identity(profile: dict) -> None:
     for key, width in (("domain", 4), ("bus", 2), ("slot", 2), ("function", 1)):
         if not re.fullmatch(rf"0x[0-9a-fA-F]{{{width}}}", str(address.get(key, ""))):
             raise ValueError(f"xHCI PCI 地址字段无效: {key}")
+    if int(address["bus"], 0) != 0:
+        raise ValueError("xHCI 必须在 PCI 总线 0，不能挂在 Root Port 后面")
     subsystem = profile.get("devices", {}).get("pci_subsystems", {}).get("usb", {})
     if (
         str(subsystem.get("vendor_id", "")).lower() != str(usb["subsystem_vendor_id"]).lower()
@@ -567,6 +593,62 @@ def validate_audio_identity(profile: dict) -> None:
         raise ValueError("板载 HDA PCI 地址无效") from exc
 
 
+def derive_lan_services(adapter: dict) -> dict:
+    gateway = adapter["gateway"]
+    subnet = ipaddress.ip_network(str(adapter["ipv4"]["subnet"]), strict=True)
+    manufacturer = str(gateway.get("manufacturer", ""))
+    prefix = ROUTER_HOSTNAME_PREFIX.get(manufacturer, "router")
+    suffix = str(gateway["mac"]).replace(":", "")[-4:]
+    gateway_ip = str(gateway["ipv4_address"])
+    return {
+        "advertise_gateway_as_dns": True,
+        "broadcast": str(subnet.broadcast_address),
+        "dns_domain": "lan",
+        "dns_servers": [gateway_ip],
+        "gateway_hostname": f"{prefix}-{suffix}",
+        "isolation": "guest-only",
+        "lease_seconds": 86400,
+    }
+
+
+def resolved_lan_services(adapter: dict) -> dict:
+    stored = adapter.get("lan_services")
+    if isinstance(stored, dict) and stored:
+        services = stored
+    else:
+        services = derive_lan_services(adapter)
+    validate_lan_services(adapter, services)
+    return services
+
+
+def validate_lan_services(adapter: dict, services: dict) -> None:
+    gateway_ip = str(adapter["gateway"]["ipv4_address"])
+    subnet = ipaddress.ip_network(str(adapter["ipv4"]["subnet"]), strict=True)
+    domain = str(services.get("dns_domain", ""))
+    hostname = str(services.get("gateway_hostname", ""))
+    if domain != "lan" or not DNS_LABEL_RE.fullmatch(hostname):
+        raise ValueError("网关 DHCP 域名或主机名无效")
+    host_label = socket.gethostname().split(".", 1)[0].lower()
+    if hostname == host_label or domain == host_label:
+        raise ValueError("网关 DHCP 身份不能使用宿主机主机名")
+    dns_servers = services.get("dns_servers")
+    if (
+        services.get("advertise_gateway_as_dns") is not True
+        or dns_servers != [gateway_ip]
+    ):
+        raise ValueError("DNS 必须只通告网关地址，不能把宿主机解析器暴露给 guest")
+    if str(services.get("broadcast", "")) != str(subnet.broadcast_address):
+        raise ValueError("DHCP 广播地址必须属于当前身份网段")
+    try:
+        lease = int(services.get("lease_seconds"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("DHCP 租约时长无效") from exc
+    if not 300 <= lease <= 604800:
+        raise ValueError("DHCP 租约时长超出家用路由范围")
+    if services.get("isolation") != "guest-only":
+        raise ValueError("网络隔离策略必须是 guest-only")
+
+
 def validate_network_identity(profile: dict) -> None:
     network = profile.get("hardware", {}).get("network", {})
     for key, expected in I226_NETWORK_IDENTITY.items():
@@ -663,6 +745,7 @@ def validate_network_identity(profile: dict) -> None:
             raise ValueError("libvirt 网络名或桥接名重复")
         if interface.get("managed_network") != network_name:
             raise ValueError(f"第 {index + 1} 块网卡的设备/网络记录不一致")
+        resolved_lan_services(adapter)
         seen_network_names.add(network_name)
         seen_bridge_names.add(bridge_name)
 
@@ -776,31 +859,75 @@ def managed_network_xml(adapter: dict) -> str:
     managed = adapter["libvirt_network"]
     ipv4 = adapter["ipv4"]
     gateway = adapter["gateway"]
-    network = ET.Element("network")
+    services = resolved_lan_services(adapter)
+    network = ET.Element("network", {"ipv6": "no"})
     ET.SubElement(network, "name").text = managed["name"]
     ET.SubElement(network, "uuid").text = managed["uuid"]
-    ET.SubElement(network, "forward", {"mode": "nat"})
+    forward = ET.SubElement(network, "forward", {"mode": "nat"})
+    nat = ET.SubElement(forward, "nat", {"ipv6": "no"})
+    ET.SubElement(nat, "port", {"start": "1024", "end": "65535"})
     ET.SubElement(network, "bridge", {
         "name": managed["bridge_name"],
         "stp": "on",
         "delay": "0",
     })
-    # This is the Ethernet identity Windows resolves for its default gateway.
+    # Ethernet identity Windows resolves for its default gateway.
     ET.SubElement(network, "mac", {"address": gateway["mac"]})
-    ET.SubElement(network, "dns", {"enable": "yes", "forwardPlainNames": "yes"})
+    ET.SubElement(network, "domain", {
+        "name": services["dns_domain"],
+        "localOnly": "yes",
+        "register": "no",
+    })
+    ET.SubElement(network, "port", {"isolated": "yes"})
+    dns = ET.SubElement(network, "dns", {"enable": "yes", "forwardPlainNames": "no"})
+    host = ET.SubElement(dns, "host", {"ip": gateway["ipv4_address"]})
+    ET.SubElement(host, "hostname").text = services["gateway_hostname"]
+    ET.SubElement(host, "hostname").text = (
+        f"{services['gateway_hostname']}.{services['dns_domain']}"
+    )
     ip_node = ET.SubElement(network, "ip", {
         "address": gateway["ipv4_address"],
         "netmask": ipv4["netmask"],
+        "localPtr": "yes",
     })
     dhcp = ET.SubElement(ip_node, "dhcp")
-    ET.SubElement(dhcp, "range", {
+    range_node = ET.SubElement(dhcp, "range", {
         "start": ipv4["dhcp_start"],
         "end": ipv4["dhcp_end"],
     })
-    ET.SubElement(dhcp, "host", {
+    ET.SubElement(range_node, "lease", {
+        "expiry": str(int(services["lease_seconds"])),
+        "unit": "seconds",
+    })
+    host_lease = ET.SubElement(dhcp, "host", {
         "mac": adapter["mac"],
         "ip": ipv4["address"],
     })
+    ET.SubElement(host_lease, "lease", {
+        "expiry": str(int(services["lease_seconds"])),
+        "unit": "seconds",
+    })
+    options = ET.SubElement(network, f"{{{DNSMASQ_NS}}}options")
+    gateway_ip = gateway["ipv4_address"]
+    # no-hosts/no-resolv: do not serve /etc/hosts or systemd-resolved to the guest.
+    for value in (
+        "no-hosts",
+        "bogus-priv",
+        "dhcp-authoritative",
+        "stop-dns-rebind",
+        "rebind-localhost-ok",
+        "no-resolv",
+        "server=1.1.1.1",
+        "server=8.8.8.8",
+        f"domain={services['dns_domain']}",
+        f"local=/{services['dns_domain']}/",
+        f"dhcp-option=option:router,{gateway_ip}",
+        f"dhcp-option=option:dns-server,{gateway_ip}",
+        f"dhcp-option=option:domain-name,{services['dns_domain']}",
+        # dnsmasq has no option:broadcast name; RFC 28 is the broadcast address.
+        f"dhcp-option=28,{services['broadcast']}",
+    ):
+        ET.SubElement(options, f"{{{DNSMASQ_NS}}}option", {"value": value})
     return ET.tostring(network, encoding="unicode")
 
 
@@ -830,6 +957,15 @@ def ensure_managed_networks(prefix: list[str], profile: dict) -> list[str]:
             ) as temporary:
                 temporary.write(managed_network_xml(adapter))
                 temporary_path = Path(temporary.name)
+            validator = shutil.which("virt-xml-validate")
+            if validator:
+                checked = run([validator, str(temporary_path), "network"], check=False)
+                if checked.returncode != 0:
+                    detail = (checked.stderr or checked.stdout or "").strip()
+                    raise RuntimeError(
+                        "身份 NAT 网络 XML 未通过校验"
+                        + (f": {detail}" if detail else "")
+                    )
             run(prefix + ["net-define", str(temporary_path)])
         finally:
             if temporary_path is not None:
@@ -866,6 +1002,167 @@ def remove_obsolete_profile_networks(prefix: list[str], names: set[str]) -> None
         if name in active_networks:
             run(prefix + ["net-destroy", name])
         run(prefix + ["net-undefine", name])
+
+
+def isolation_bridges(profile: dict) -> list[str]:
+    return [
+        str(adapter["libvirt_network"]["bridge_name"])
+        for adapter in profile["identity"]["network_adapters"]
+    ]
+
+
+def isolation_guest_ips(profile: dict) -> list[str]:
+    return [
+        str(adapter["ipv4"]["address"])
+        for adapter in profile["identity"]["network_adapters"]
+    ]
+
+
+def isolation_gateway_ips(profile: dict) -> list[str]:
+    return [
+        str(adapter["gateway"]["ipv4_address"])
+        for adapter in profile["identity"]["network_adapters"]
+    ]
+
+
+def guest_isolation_nft(bridges: list[str], guest_ips: list[str], gateway_ips: list[str]) -> str:
+    """Hide the hypervisor behind the fake router; host may still reach the guest."""
+    if not bridges:
+        raise ValueError("没有可隔离的身份网桥")
+    if not guest_ips:
+        raise ValueError("没有可放行的 guest 地址")
+    if not gateway_ips:
+        raise ValueError("没有可放行的网关地址")
+    elements = ", ".join(f'"{name}"' for name in bridges)
+    guests = ", ".join(guest_ips)
+    gateways = ", ".join(gateway_ips)
+    networks = ", ".join(PRIVATE_FORWARD_NETWORKS)
+    return f"""destroy table inet {ISOLATION_TABLE}
+table inet {ISOLATION_TABLE} {{
+  set bridges {{
+    type ifname
+    elements = {{ {elements} }}
+  }}
+
+  set guest_ips {{
+    type ipv4_addr
+    elements = {{ {guests} }}
+  }}
+
+  set gateway_ips {{
+    type ipv4_addr
+    elements = {{ {gateways} }}
+  }}
+
+  chain input {{
+    type filter hook input priority -150; policy accept;
+    iifname @bridges meta nfproto ipv6 drop
+    iifname @bridges udp dport 67 accept
+    iifname @bridges ip daddr @gateway_ips udp dport 53 accept
+    iifname @bridges ip daddr @gateway_ips tcp dport {{ 22, 53 }} accept
+    iifname @bridges ip daddr @gateway_ips icmp type echo-request accept
+    iifname @bridges ct state established,related accept
+    iifname @bridges drop
+  }}
+
+  chain output {{
+    type filter hook output priority -150; policy accept;
+    oifname @bridges meta nfproto ipv6 drop
+    oifname @bridges udp sport {{ 53, 67 }} accept
+    oifname @bridges tcp sport 53 accept
+    oifname @bridges icmp type echo-reply accept
+    oifname @bridges icmp type destination-unreachable icmp code 4 accept
+    oifname @bridges icmp type time-exceeded accept
+    oifname @bridges ip daddr @guest_ips accept
+    oifname @bridges ct state established,related accept
+    oifname @bridges drop
+  }}
+
+  chain forward {{
+    type filter hook forward priority -150; policy accept;
+    iifname @bridges meta nfproto ipv6 drop
+    oifname @bridges meta nfproto ipv6 drop
+    iifname @bridges fib daddr type local drop
+    iifname @bridges ip daddr {{ {networks} }} drop
+    iifname @bridges pkttype {{ multicast, broadcast }} drop
+  }}
+}}
+"""
+
+
+def guest_isolation_script(bridges: list[str], nft_path: Path) -> str:
+    lines = [
+        "#!/bin/bash",
+        "set -euo pipefail",
+        f"/usr/sbin/nft -f {nft_path}",
+        "/usr/sbin/sysctl -w net.ipv4.icmp_errors_use_inbound_ifaddr=1 >/dev/null",
+    ]
+    for bridge in bridges:
+        lines.extend((
+            f"/usr/sbin/sysctl -w net.ipv6.conf.{bridge}.disable_ipv6=1 >/dev/null 2>&1 || true",
+            f"/usr/sbin/sysctl -w net.ipv4.conf.{bridge}.accept_redirects=0 >/dev/null 2>&1 || true",
+            f"/usr/sbin/sysctl -w net.ipv4.conf.{bridge}.send_redirects=0 >/dev/null 2>&1 || true",
+        ))
+    return "\n".join(lines) + "\n"
+
+
+def guest_isolation_unit(script_path: Path) -> str:
+    return (
+        "[Unit]\n"
+        "Description=ovo-spoof guest-only network isolation\n"
+        "After=network-pre.target libvirtd.service virtqemud.service\n"
+        "Before=libvirt-guests.service\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "RemainAfterExit=yes\n"
+        f"ExecStart={script_path}\n"
+        f"ExecReload={script_path}\n"
+        f"ExecStop=/usr/sbin/nft destroy table inet {ISOLATION_TABLE}\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
+def apply_guest_isolation(profile: dict, runtime: Path) -> Path:
+    bridges = isolation_bridges(profile)
+    network_dir = runtime / "network"
+    nft_path = network_dir / "guest-isolation.nft"
+    script_path = network_dir / "apply-isolation.sh"
+    unit_path = Path("/etc/systemd/system") / ISOLATION_UNIT
+    privilege = [] if os.geteuid() == 0 else ["sudo"]
+    if privilege:
+        if shutil.which("sudo") is None:
+            raise RuntimeError("需要 sudo 安装 guest 网络隔离规则")
+        run_visible(["sudo", "-v"])
+    run_visible(privilege + ["install", "-d", "-m", "0755", str(network_dir)])
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        nft_tmp = temp / "guest-isolation.nft"
+        script_tmp = temp / "apply-isolation.sh"
+        unit_tmp = temp / ISOLATION_UNIT
+        nft_tmp.write_text(
+            guest_isolation_nft(
+                bridges,
+                isolation_guest_ips(profile),
+                isolation_gateway_ips(profile),
+            ),
+            encoding="utf-8",
+        )
+        script_tmp.write_text(guest_isolation_script(bridges, nft_path), encoding="utf-8")
+        unit_tmp.write_text(guest_isolation_unit(script_path), encoding="utf-8")
+        check = run(privilege + ["/usr/sbin/nft", "-c", "-f", str(nft_tmp)], check=False)
+        if check.returncode != 0:
+            detail = (check.stderr or check.stdout or "").strip()
+            raise RuntimeError("guest 隔离 nftables 规则无效" + (f": {detail}" if detail else ""))
+        run_visible(privilege + ["install", "-m", "0644", str(nft_tmp), str(nft_path)])
+        run_visible(privilege + ["install", "-m", "0755", str(script_tmp), str(script_path)])
+        run_visible(privilege + ["install", "-m", "0644", str(unit_tmp), str(unit_path)])
+    run_visible(privilege + ["systemctl", "daemon-reload"])
+    run_visible(privilege + ["systemctl", "enable", ISOLATION_UNIT])
+    run_visible(privilege + ["systemctl", "restart", ISOLATION_UNIT])
+    return nft_path
 
 
 def domain_state(prefix: list[str], name: str) -> str:
@@ -1083,9 +1380,8 @@ def normalize_pcie_root_ports(devices: ET.Element) -> None:
         else:
             # Keep libvirt's controller model while selecting QEMU's real
             # Intel IOH backend through the nested model element.  These ports
-            # represent fixed internal devices, so do not let Windows treat
-            # their children (notably the xHCI controller) as ejectable PCIe
-            # hardware.
+            # represent fixed chipset-side links, so do not let Windows treat
+            # downstream devices as ejectable PCIe hardware.
             controller.set("model", "pcie-root-port")
             model = controller.find("model")
             if model is None:
@@ -1219,9 +1515,10 @@ def validate_profiled_root_ports(devices: ET.Element, profile: dict) -> None:
         actual_role = guest_root_port_role(devices, index)
         expected = item.get("guest_role")
         if actual_role != expected:
-            # 04 disables emulated xHCI when there is no USB hostdev, so a port
-            # that 01 classified as usb becomes empty after normalize.
-            if expected == "usb" and actual_role == "empty":
+            # Integrated PCH xHCI lives on bus 0, not behind a Root Port.
+            # Older identities classified libvirt's default bus-1 qemu-xhci as
+            # guest_role=usb; after normalize that port is empty.
+            if expected == "usb" and actual_role == "empty" and guest_has_root_bus_xhci(devices):
                 continue
             raise ValueError(
                 f"PCIe Root Port 0x{port:02x} 下游是 {actual_role}，"
@@ -1323,7 +1620,7 @@ def hostdev_is_usb_controller(bdf: str) -> bool:
 
 
 def disable_emulated_usb_controller(devices: ET.Element) -> None:
-    """Keep libvirt from auto-inserting qemu-xhci when it is not required."""
+    """Keep libvirt from auto-inserting qemu-xhci when the PCH slot is passed through."""
     for node in list(devices.findall("controller")):
         if node.get("type") == "usb":
             devices.remove(node)
@@ -1342,44 +1639,90 @@ def strip_emulated_usb_hid(devices: ET.Element) -> None:
             devices.remove(node)
 
 
-def has_usb_device_hostdev(devices: ET.Element) -> bool:
-    return any(node.get("type") == "usb" for node in devices.findall("hostdev"))
+def profile_xhci_address(usb: dict) -> tuple[int, int, int]:
+    address = usb["pci_address"]
+    try:
+        bus = int(address["bus"], 0)
+        slot = int(address["slot"], 0)
+        function = int(address["function"], 0)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("身份文件缺少 xHCI PCI 地址") from exc
+    if bus != 0 or not (0 <= slot <= 31 and 0 <= function <= 7):
+        raise ValueError("xHCI PCI 槽位超出 Q35 根总线范围")
+    return bus, slot, function
+
+
+def hostdev_source_bdf(hostdev: ET.Element) -> str | None:
+    address = hostdev.find("source/address")
+    if address is None:
+        return None
+    try:
+        return (
+            f"{int(address.get('domain', '0'), 0):04x}:"
+            f"{int(address.get('bus', '0'), 0):02x}:"
+            f"{int(address.get('slot', '0'), 0):02x}."
+            f"{int(address.get('function', '0'), 0)}"
+        )
+    except ValueError:
+        return None
+
+
+def guest_has_root_bus_xhci(devices: ET.Element) -> bool:
+    for node in devices.findall("controller"):
+        if node.get("type") != "usb" or node.get("model") in {None, "none"}:
+            continue
+        occupied = pci_address_tuple(node)
+        if occupied is not None and occupied[0] == 0:
+            return True
+    return False
+
+
+def profile_xhci_replaced_by_hostdev(devices: ET.Element, profile: dict) -> bool:
+    """True when the host PCH xHCI itself is already passed through."""
+    usb = profile["hardware"]["usb_controller"]
+    wanted = profile_xhci_address(usb)
+    host_bdf = str(usb.get("bdf") or "").lower()
+    for hostdev in devices.findall("hostdev"):
+        if hostdev.get("type") != "pci":
+            continue
+        source = hostdev_source_bdf(hostdev)
+        if host_bdf and source == host_bdf:
+            return True
+        if pci_address_tuple(hostdev) == wanted:
+            return True
+    return False
 
 
 def normalize_usb_controller(devices: ET.Element, profile: dict) -> None:
-    pci_xhci = any(hostdev_is_usb_controller(bdf) for bdf in pci_hostdev_bdfs(devices))
-    if pci_xhci or not has_usb_device_hostdev(devices):
+    """Pin the profiled qemu-xhci on the host PCH slot, usually 00:14.0.
+
+    Do not leave model='none' just because there is no USB hostdev.  Do not
+    place xHCI behind a Root Port.  Omit libvirt ports= so QEMU keeps the
+    profile p2/p3 values instead of 15/15.  Skip emulation only when the
+    host PCH controller is already a PCI hostdev.
+    """
+    usb = profile["hardware"]["usb_controller"]
+    if usb.get("qemu_model") != "qemu-xhci":
+        raise ValueError("xHCI 后端模型不受支持")
+    if profile_xhci_replaced_by_hostdev(devices, profile):
         disable_emulated_usb_controller(devices)
         return
 
-    usb = profile["hardware"]["usb_controller"]
     controllers = devices.findall("controller[@type='usb']")
     controller = controllers[0] if controllers else ET.SubElement(devices, "controller")
     for extra in controllers[1:]:
         devices.remove(extra)
 
     wanted_address = usb["pci_address"]
-    wanted_bus = int(wanted_address["bus"], 0)
-    wanted_slot = int(wanted_address["slot"], 0)
-    wanted_function = int(wanted_address["function"], 0)
+    wanted = profile_xhci_address(usb)
     for node in devices:
         if node is controller:
             continue
-        address = node.find("address")
-        if address is None or address.get("type") != "pci":
-            continue
-        try:
-            occupied = (
-                int(address.get("bus", "0"), 0),
-                int(address.get("slot", "0"), 0),
-                int(address.get("function", "0"), 0),
-            )
-        except ValueError:
-            continue
-        if occupied == (wanted_bus, wanted_slot, wanted_function):
+        occupied = pci_address_tuple(node)
+        if occupied == wanted:
             raise ValueError(
                 "xHCI 目标 PCI 地址已被其他设备占用: "
-                f"{wanted_bus:02x}:{wanted_slot:02x}.{wanted_function}"
+                f"{wanted[0]:02x}:{wanted[1]:02x}.{wanted[2]}"
             )
 
     controller.attrib.clear()
@@ -1532,6 +1875,10 @@ def set_devices(root: ET.Element, profile: dict) -> None:
             driver = interface.find("driver")
             if driver is not None:
                 interface.remove(driver)
+            port = interface.find("port")
+            if port is None:
+                port = ET.SubElement(interface, "port")
+            port.set("isolated", "yes")
 
     current_hostdevs: list[str] = []
     for hostdev in root.findall("./devices/hostdev[@type='pci']"):
@@ -1694,6 +2041,18 @@ def main() -> int:
                 fromfile=f"{domain}.current.xml", tofile=f"{domain}.spoof-v2.xml", lineterm="",
             )
             print("\n".join(diff) or "XML 无变化")
+            for index, adapter in enumerate(profile["identity"]["network_adapters"], 1):
+                services = resolved_lan_services(adapter)
+                print(f"\n--- 计划中的身份 NAT 网络 {index} ({services['isolation']}) ---")
+                print(managed_network_xml(adapter).strip())
+            print("\n--- 计划中的 guest 隔离 nftables ---")
+            print(
+                guest_isolation_nft(
+                    isolation_bridges(profile),
+                    isolation_guest_ips(profile),
+                    isolation_gateway_ips(profile),
+                ).strip()
+            )
             return 0
         state = domain_state(prefix, domain)
         if "shut" not in state and "关闭" not in state:
@@ -1705,6 +2064,7 @@ def main() -> int:
         old_profile_networks = profile_networks_in_domain(root)
         apply_profile(root, profile, domain, runtime)
         networks = ensure_managed_networks(prefix, profile)
+        apply_guest_isolation(profile, runtime)
         result = ET.tostring(root, encoding="unicode")
         temporary = backup.with_suffix(".new.xml")
         try:
@@ -1722,13 +2082,17 @@ def main() -> int:
         print(f"运行时目录：{runtime}")
         print(f"当前存储总线：{', '.join(item['bus'] for item in profile['storage']['devices']) or 'none'}")
         for index, adapter in enumerate(profile["identity"]["network_adapters"], 1):
+            services = resolved_lan_services(adapter)
             print(
                 f"网络{index}：MAC {adapter['mac']}，"
                 f"IP {adapter['ipv4']['address']}/{adapter['ipv4']['prefix_length']} "
                 f"via {adapter['gateway']['ipv4_address']} "
-                f"({adapter['gateway']['mac']})"
+                f"({adapter['gateway']['mac']}) "
+                f"DHCP {services['gateway_hostname']}.{services['dns_domain']} "
+                f"isolation={services['isolation']}"
             )
         print(f"已启用身份专属 NAT 网络：{', '.join(networks)}")
+        print("双方可以互相 SSH。guest 仍看不到宿主机名、内网、IPv6 和网关以外的宿主机服务。公网 NAT 仍保留。")
         print("SMBIOS UUID、MAC 和磁盘 serial 已从 identity-hardware.json 注入；libvirt 域 UUID 保持不变。")
         return 0
     except (OSError, ValueError, RuntimeError, ET.ParseError, json.JSONDecodeError) as exc:
